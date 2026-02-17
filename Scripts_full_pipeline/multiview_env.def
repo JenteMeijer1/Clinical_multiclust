@@ -1,0 +1,34 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%post
+    # Update and install any necessary OS-level packages
+    apt-get update && apt-get install -y build-essential
+
+    # Upgrade pip and install Python dependencies
+    pip install --no-cache-dir --upgrade pip
+    pip install --no-cache-dir \
+        numpy \
+        scipy \
+        torch \
+        scikit-learn \
+        scikit-optimize \
+        pandas \
+        matplotlib \
+        dill \
+        joblib \
+        typing_extensions \
+        packaging \
+        python-dateutil \
+        pytz \
+        deap \
+        seaborn \
+        tabulate \
+        typing \
+        fastcluster
+
+%environment
+    # Set up environment variables if needed
+    export LC_ALL=C
+    export LANG=C
+

@@ -1,0 +1,2113 @@
+---
+title: "MultiCluster"
+author: "J. Meijer"
+date: "2025-01-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+
+
+Check for weird numbers:
+- chrfigs_fam_age
+- chrchs_timeslept
+
+
+
+Check if variables with only one option are removed.
+
+
+```{r}
+# Load libraries
+library(flextable)
+library(officer)
+library(dplyr)
+library(readr)
+library(readxl)
+
+```
+
+
+## Simulated data for Parea test
+
+### Single modality
+```{r}
+library(pacman)
+library(rlist)
+#p_load("tidyverse", "ggplot2", "Rdimtools", "ggthemes", "mice", "mnorm")
+```
+
+```{r}
+# Prepare multivariate normal vector parameters
+# expected value
+mean <- c(2.5, 2.5, 3)
+n_dim <- length(mean)
+
+# correlation matrix
+cor <- c( 1, 0.3, 0.1,
+0.3, 1, 0.2,
+0.1, 0.2, 1)
+cor <- matrix(cor, ncol = n_dim, nrow = n_dim, byrow = TRUE)
+
+# covariance matrix
+sd_mat <- diag(c(1.2, 1.2, 1))
+sigma <- sd_mat %*% cor %*% t(sd_mat)
+
+# Generate data from this distribution
+d1<-rmnorm(n = 300, mean = mean, sigma = sigma)
+
+
+# Prepare multivariate normal vector parameters
+# expected value
+mean <- c(0, 0, -1)
+n_dim <- length(mean)
+# correlation matrix
+cor <- c( 1, 0.3, 0.1,
+0.3, 1, 0.2,
+0.1, 0.2, 1)
+cor <- matrix(cor, ncol = n_dim, nrow = n_dim, byrow = TRUE)
+
+# covariance matrix
+sd_mat <- diag(c(0.7, 0.7, 0.5))
+sigma <- sd_mat %*% cor %*% t(sd_mat)
+
+# Generate data from this distribution
+d2<-rmnorm(n = 150, mean = mean, sigma = sigma)
+
+
+# Prepare multivariate normal vector parameters
+# expected value
+mean <- c(5, -1, -3)
+n_dim <- length(mean)
+
+# correlation matrix
+cor <- c( 1, 0.3, 0.1,
+0.3, 1, 0.2,
+0.1, 0.2, 1)
+cor <- matrix(cor, ncol = n_dim, nrow = n_dim, byrow = TRUE)
+
+# covariance matrix
+sd_mat <- diag(c(1, 1, 0.7))
+sigma <- sd_mat %*% cor %*% t(sd_mat)
+
+# Generate data from this distribution
+d3<-rmnorm(n = 150, mean = mean, sigma = sigma)
+
+ #Merge d1, d2, and d3 along the rows
+source <- rbind(d1,d2,d3)
+names(source)<-c("X1","X2","X3")
+
+## Establish group class for each observation
+group <- c(rep("Group1",300),rep("Group2",150),rep("Group3",150)) 
+
+
+# Random projection into 10 variables 
+set.seed(1234) 
+dta <- lapply(1:3, function(x) do.rndproj(source,ndim = 3)$Y) 
+
+## Combine the data in the generated list 'dta' into a data frame
+dta <- rlist::list.cbind(dta) 
+dta<-base::cbind(source,dta)
+names(dta)<-paste("V",1:12)
+
+
+## Convert 'dta' to a tibble data frame
+dta <- as_tibble(dta) 
+
+## Add a column named 'group' name to data
+dta$group <- group  
+
+## Add additional noise and outliers
+# Add noise
+set.seed(1234) 
+for (i in 1:10) {
+    sd <- runif(1, 0.1, 1) 
+    dta[,i] <- dta[,i] + rnorm(nrow(dta), 0, sd )
+}
+
+## Add a few outliers 
+dta[30,1] <- 15
+dta[60,4] <- -9
+dta[250,6] <- 15
+dta[556,10] <- 18
+```
+
+```{r}
+library(FactoMineR)
+library(factoextra)
+## Perform Principal Component Analysis (PCA) on the first 10 columns of 'dta'
+res.pca <- FactoMineR::PCA(dta %>%  select(V1:V12), 
+                           scale.unit = TRUE, 
+                           ncp = 3, 
+                           graph = FALSE) 
+
+factoextra::fviz_pca_ind(res.pca,
+             geom.ind = "point", 
+             col.ind = dta$group, # color by groups
+             palette = c("#A0DCFF", "#A6A6A6", "#419AB0"),
+             addEllipses = TRUE, # Concentration ellipses
+             legend.title = "Groups",
+             axes=c(1,2)) 
+```
+```{r}
+## Random order the rows of 'dta' 
+set.seed(12345)
+dta <- dta[sample(1:nrow(dta)), ]
+
+## Add "ID" 
+dta <- tibble::rownames_to_column(dta,var = "ID")  %>% 
+  mutate(ID=as.numeric(ID))
+
+## Store group name separately
+group <- dta %>% select(ID, group) 
+
+## Keep clustering variables
+dta <- dta %>% select(ID,V1:V12) 
+```
+
+
+Save data so we can load in python and run Parea
+```{r}
+# Define three views of four variables each:
+views <- list(
+  view1 = as.matrix(dta %>% select(V1:V4)),
+  view2 = as.matrix(dta %>% select(V5:V8)),
+  view3 = as.matrix(dta %>% select(V9:V12))
+)
+
+
+# Save dataframes
+output_dir <- "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/MultiCluster"
+for (i in seq_along(views)) {
+  fname <- file.path(output_dir, paste0(names(views)[i], ".csv"))
+  write.csv(views[[i]], file = fname, row.names = FALSE)
+}
+
+# (Optional) also save your grouping vector
+write.csv(group,
+          file = file.path(output_dir, "group_labels.csv"),
+          row.names = FALSE)
+
+```
+
+
+### Multimodal
+
+```{r}
+suppressPackageStartupMessages({ library(tidyverse); library(mvtnorm) })
+
+.make_centroids <- function(k, p, bscale){
+  C <- matrix(rnorm(k*p), nrow=k)
+  scale(C, scale=FALSE) * bscale
+}
+
+simulate_multimodal_combinatorial <- function(
+  subgroups_per_mod,     # e.g., c(3,4,2) → m1 has 3 subgrps, m2 has 4, m3 has 2
+  p_per_mod,             # features per modality, e.g., c(6,8,5)
+  combos,                # tibble(final=..., m1=..., m2=..., m3=...)
+  n_per_final,           # sizes per final cluster (length = nrow(combos))
+  between_scale = NULL,  # per-modality centroid separation
+  within_sd     = NULL,  # per-modality cluster tightness
+  noise_sd      = NULL,  # per-modality observation noise
+  seed = 123
+){
+  set.seed(seed)
+  M <- length(subgroups_per_mod)
+  stopifnot(length(p_per_mod) == M, ncol(combos) == M + 1)
+  stopifnot(all(names(combos)[-1] == paste0("m", 1:M)))
+  if (is.null(between_scale)) between_scale <- rep(3.8, M)
+  if (is.null(within_sd))     within_sd     <- rep(0.20, M)
+  if (is.null(noise_sd))      noise_sd      <- rep(0.06, M)
+
+  # centroids per modality subgroup (independent across modalities)
+  C_mod <- lapply(1:M, function(m){
+    k <- subgroups_per_mod[m]; p <- p_per_mod[m]
+    C <- .make_centroids(k, p, between_scale[m])
+    rownames(C) <- paste0("m", m, "_s", 1:k)
+    C
+  })
+
+  # expand final cluster membership
+  final_labels <- rep(combos$final, times = n_per_final)
+  N <- length(final_labels)
+
+  # per-modality subgroup indices for each subject
+  mod_idx <- lapply(1:M, function(m) rep(combos[[paste0("m", m)]], times = n_per_final))
+  mod_lab <- lapply(1:M, function(m) paste0("M", m, "_S", mod_idx[[m]]))
+
+  # generate features per modality
+  views <- vector("list", M)
+  for (m in 1:M){
+    p <- p_per_mod[m]
+    Sigma <- diag(within_sd[m]^2, p)
+    X <- matrix(NA_real_, nrow=N, ncol=p)
+    for (i in 1:N){
+      mu <- C_mod[[m]][mod_idx[[m]][i], ]
+      X[i, ] <- mvtnorm::rmvnorm(1, mean = mu, sigma = Sigma) + rnorm(p, sd = noise_sd[m])
+    }
+    views[[m]] <- as_tibble(X)
+    names(views[[m]]) <- paste0("V", 1:ncol(views[[m]]))
+  }
+
+  labels <- tibble(
+    ID = 1:N,
+    final_cluster = final_labels
+  )
+  for (m in 1:M) labels[[paste0("subgroup_m", m)]] <- mod_lab[[m]]
+
+  list(views = views, labels = labels)
+}
+
+
+
+# Define which combinations actually exist (you can change these)
+combos <- tibble::tibble(
+  final = c("F1","F2","F3","F4","F5"),
+  m1    = c(1,   2,   2,   3,   3),   # m1 subgroup index
+  m2    = c(1,   2,   3,   2,   4),   # m2 subgroup index
+  m3    = c(1,   1,   2,   2,   1)    # m3 subgroup index
+)
+
+
+
+# Simulation with 3 modalities that all have clusters
+sim <- simulate_multimodal_combinatorial(
+  subgroups_per_mod = c(3,4,2),   # m1,m2,m3
+  p_per_mod         = c(6,8,5),   # features per modality
+  combos            = combos,
+  n_per_final       = c(220, 180, 200, 180, 220), # class sizes
+  between_scale     = c(0.8, 1.3, 0.7),           # ↑ separation within each modality
+  within_sd         = c(0.38, 0.38, 0.40),        # ↓ tighter clusters
+  noise_sd          = c(0.06, 0.06, 0.06),
+  seed = 11
+)
+
+
+suppressPackageStartupMessages({ library(FactoMineR); library(factoextra) })
+viz_view <- function(view_df, color_labels, title){
+  keep <- stats::complete.cases(view_df)
+  X <- as.data.frame(view_df[keep, , drop = FALSE])
+
+  res <- FactoMineR::PCA(X, scale.unit = TRUE, ncp = 3, graph = FALSE)
+
+  factoextra::fviz_pca_ind(
+    res, geom = "point",
+    col.ind = color_labels[keep],
+    addEllipses = TRUE, legend.title = title
+  )
+}
+ viz_view(sim$views[[1]], sim$labels$subgroup_m1, "m1 subgroups")
+ viz_view(sim$views[[2]], sim$labels$subgroup_m2, "m2 subgroups")
+ viz_view(sim$views[[3]], sim$labels$subgroup_m3, "m3 subgroups")
+ 
+ 
+
+
+```
+```{r}
+# Simulation if you want a forth modality without any clusters
+
+combos4 <- tibble::tibble(
+  final = c("F1","F2","F3","F4","F5"),
+  m1    = c(1,2,2,3,3),
+  m2    = c(1,2,3,2,4),
+  m3    = c(1,1,2,2,1),
+  m4    = 1L                   # <- unimodal modality (single subgroup)
+)
+
+sim4 <- simulate_multimodal_combinatorial(
+  subgroups_per_mod = c(3,4,2,1),        # <- m4 has one subgroup
+  p_per_mod         = c(6,8,5,6),        # features per modality (choose p4 as you like)
+  combos            = combos4,
+  n_per_final       = c(220, 180, 200, 180, 220),
+  # scales/SDs still need length 4; values for m4 don’t really matter when k=1
+  between_scale     = c(0.8, 1.8, 1.2, 0.0), # ↑ separation within each modality
+  within_sd         = c(0.38, 0.38, 0.40, 0.40),  # ↓ tighter clusters
+  noise_sd          = c(0.06, 0.06, 0.06, 0.06),
+  seed = 11
+)
+
+
+suppressPackageStartupMessages({ library(FactoMineR); library(factoextra) })
+viz_view <- function(view_df, color_labels, title){
+  keep <- stats::complete.cases(view_df)
+  X <- as.data.frame(view_df[keep, , drop = FALSE])
+
+  res <- FactoMineR::PCA(X, scale.unit = TRUE, ncp = 3, graph = FALSE)
+
+  factoextra::fviz_pca_ind(
+    res, geom = "point",
+    col.ind = color_labels[keep],
+    addEllipses = TRUE, legend.title = title
+  )
+}
+ viz_view(sim4$views[[1]], sim4$labels$subgroup_m1, "m1 subgroups")
+ viz_view(sim4$views[[2]], sim4$labels$subgroup_m2, "m2 subgroups")
+ viz_view(sim4$views[[3]], sim4$labels$subgroup_m3, "m3 subgroups")
+ viz_view(sim4$views[[4]], sim4$labels$subgroup_m4, "m4 subgroups")
+
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(FactoMineR)
+  library(factoextra)
+  library(tidyverse)
+})
+
+viz_final_by_modality_from_sim <- function(sim, point_size = 1.5){
+  stopifnot(is.list(sim), !is.null(sim$views), !is.null(sim$labels$final_cluster))
+  M <- length(sim$views)
+
+  plots <- vector("list", M)
+  for(m in seq_len(M)){
+    X <- as.data.frame(sim$views[[m]])
+    keep <- stats::complete.cases(X)
+    if(!any(keep)) stop(sprintf("All rows are NA for modality %d", m))
+
+    # PCA handles scaling:
+    pca <- FactoMineR::PCA(X[keep, , drop = FALSE],
+                           scale.unit = TRUE, ncp = 3, graph = FALSE)
+
+    p <- factoextra::fviz_pca_ind(
+      pca,
+      geom      = "point",
+      col.ind   = sim$labels$final_cluster[keep],
+      addEllipses = TRUE,
+      legend.title = "Final cluster",
+      pointsize = point_size
+    ) + ggplot2::ggtitle(paste0("Modality m", m, " (colored by final_cluster)"))
+
+    plots[[m]] <- p
+  }
+  plots
+}
+
+# Usage:
+ figs <- viz_final_by_modality_from_sim(sim)
+ print(figs[[1]]); print(figs[[2]]); print(figs[[3]])
+```
+
+
+```{r}
+## For 3 subgroups without any groups that do not have clusters.
+# Prefix features by modality name m1_, m2_, m3_
+for (m in seq_along(sim$views)) names(sim$views[[m]]) <- paste0("m", m, "_", names(sim$views[[m]]))
+
+# Wide table with study info (kept out of modalities)
+wide_df <- tibble(src_subject_id = sprintf("sub-%04d", sim$labels$ID)) %>%
+  bind_cols(sim$labels %>% select(final_cluster, subgroup_m1, subgroup_m2, subgroup_m3)) %>%
+  bind_cols(sim$views) %>% relocate(src_subject_id)
+
+# Meta table exactly as requested
+meta_features <- bind_rows(lapply(seq_along(sim$views), function(m){
+  tibble(
+    ElementName = names(sim$views[[m]]),
+    Datatype    = c("m1_questionnaire","m2_signal","m3_measure")[m],  # placeholders
+    Modality    = paste0("m", m)
+  )
+}))
+meta_study <- tibble(
+  ElementName = c("final_cluster","subgroup_m1","subgroup_m2","subgroup_m3"),
+  Datatype    = "study_info",
+  Modality    = "study_info"
+)
+meta_spartan <- bind_rows(meta_study, meta_features) %>%
+  arrange(factor(Modality, levels=c("study_info","m1","m2","m3")), ElementName)
+
+# shuffle rows
+set.seed(12345)
+wide_df <- wide_df[sample(nrow(wide_df)), , drop = FALSE]
+row.names(wide_df) <- NULL
+
+# Save (adjust path)
+out <- "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/MultiCluster"
+if(!dir.exists(out)) dir.create(out, recursive = TRUE)
+write.csv(wide_df,      file.path(out, "synthetic_multimodal_spartan.csv"),      row.names = FALSE)
+write.csv(meta_spartan, file.path(out, "synthetic_multimodal_spartan_meta.csv"), row.names = FALSE)
+```
+
+```{r}
+## For 4 subgroups with a group that do not have clusters.
+# Prefix features by modality name m1_, m2_, m3_, m4_
+for (m in seq_along(sim4$views)) names(sim4$views[[m]]) <- paste0("m", m, "_", names(sim4$views[[m]]))
+
+# Wide table with study info (kept out of modalities)
+wide_df <- tibble(src_subject_id = sprintf("sub-%04d", sim4$labels$ID)) %>%
+  bind_cols(sim4$labels %>% select(final_cluster, subgroup_m1, subgroup_m2, subgroup_m3, subgroup_m4)) %>%
+  bind_cols(sim4$views) %>% relocate(src_subject_id)
+
+# Meta table exactly as requested
+meta_features <- bind_rows(lapply(seq_along(sim4$views), function(m){
+  tibble(
+    ElementName = names(sim4$views[[m]]),
+    Datatype    = c("m1_questionnaire","m2_signal","m3_measure","m4_cognition")[m],  # placeholders
+    Modality    = paste0("m", m)
+  )
+}))
+meta_study <- tibble(
+  ElementName = c("final_cluster","subgroup_m1","subgroup_m2","subgroup_m3", "subgroup_m4"),
+  Datatype    = "study_info",
+  Modality    = "study_info"
+)
+meta_spartan <- bind_rows(meta_study, meta_features) %>%
+  arrange(factor(Modality, levels=c("study_info","m1","m2","m3", "m4")), ElementName)
+
+# shuffle rows
+set.seed(12345)
+wide_df <- wide_df[sample(nrow(wide_df)), , drop = FALSE]
+row.names(wide_df) <- NULL
+
+# Save (adjust path)
+out <- "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/MultiCluster"
+if(!dir.exists(out)) dir.create(out, recursive = TRUE)
+write.csv(wide_df,      file.path(out, "synthetic_multimodal_spartan.csv"),      row.names = FALSE)
+write.csv(meta_spartan, file.path(out, "synthetic_multimodal_spartan_meta.csv"), row.names = FALSE)
+```
+
+
+
+### Multimodality try 2
+```{r}
+# Generate synthetic multi-view clustering data
+# - 3 modalities
+# - 3 clusters shared across modalities:
+#     cluster 1: mean shifted down
+#     cluster 2: baseline
+#     cluster 3: mean shifted up
+#
+# Returns:
+#   $views   list of matrices (one per modality), rows = samples, cols = features
+#   $labels  factor of true cluster labels (1, 2, 3)
+#
+generate_multiview_data <- function(
+  n           = 300,       # total number of samples
+  p_per_view  = c(5, 5, 5),# number of features per modality
+  base_means  = c(0, 2, -1),   # base mean for each modality
+  base_sds    = c(1, 0.5, 1.5),# base sd for each modality
+  shift_size  = c(1, 0.7, 1.3),# cluster shift size per modality
+  seed        = 123
+) {
+  if (length(p_per_view) != 3)
+    stop("p_per_view must have length 3 (one value per modality).")
+  if (length(base_means) != 3 || length(base_sds) != 3 || length(shift_size) != 3)
+    stop("base_means, base_sds, and shift_size must all have length 3.")
+  if (n %% 3 != 0)
+    stop("n must be divisible by 3 so clusters are equally sized.")
+  
+  set.seed(seed)
+  
+  k <- 3
+  n_per_cluster <- n / k
+  
+  # Cluster labels: 1 = down, 2 = baseline, 3 = up (before shuffling)
+  labels <- rep(1:3, each = n_per_cluster)
+  # Shuffle individuals so clusters aren't ordered
+  perm <- sample(seq_len(n))
+  labels <- labels[perm]
+  
+  views <- vector("list", length = 3)
+  
+  for (m in 1:3) {
+    p <- p_per_view[m]
+    
+    # Base distribution for this modality (no cluster yet)
+    X <- matrix(
+      rnorm(n * p, mean = base_means[m], sd = base_sds[m]),
+      nrow = n, ncol = p
+    )
+    
+    # Introduce shared cluster structure:
+    # cluster 1: shift down by shift_size[m]
+    # cluster 2: no shift
+    # cluster 3: shift up by shift_size[m]
+    X[labels == 1, ] <- X[labels == 1, ] - shift_size[m]
+    X[labels == 3, ] <- X[labels == 3, ] + shift_size[m]
+    
+    colnames(X) <- paste0("V", m, "_", seq_len(p))
+    views[[m]] <- X
+  }
+  
+  names(views) <- paste0("modality_", 1:3)
+  
+  list(
+    views  = views,
+    labels = factor(labels)
+  )
+}
+
+### Example usage -----------------------------------------
+
+sim <- generate_multiview_data(
+  n          = 999,
+  p_per_view = c(10, 8, 6),
+  base_means = c(0, 2, -1),
+  base_sds   = c(1, 0.5, 1.5),
+  shift_size = c(2, 1.5, 3),
+  seed       = 42
+)
+
+str(sim$views[[1]])   # first modality matrix
+table(sim$labels)     # true cluster sizes
+
+```
+```{r}
+library(ggplot2)
+
+plot_pca_view <- function(X, lab, title = "PCA") {
+  pca <- prcomp(X, scale. = TRUE)
+  
+  df <- data.frame(
+    PC1   = pca$x[, 1],
+    PC2   = pca$x[, 2],
+    label = factor(lab)   # ensure the label column ALWAYS exists
+  )
+  
+  ggplot(df, aes(x = PC1, y = PC2, color = label)) +
+    geom_point(alpha = 0.7, size = 2) +
+    labs(title = title, color = "Cluster") +
+    theme_minimal()
+}
+
+p1 <- plot_pca_view(sim$views[[1]], sim$labels, "Modality 1 - PCA")
+p2 <- plot_pca_view(sim$views[[2]], sim$labels, "Modality 2 - PCA")
+p3 <- plot_pca_view(sim$views[[3]], sim$labels, "Modality 3 - PCA")
+
+p1
+p2
+p3
+```
+
+```{r}
+library(ggplot2)
+
+plot_pca_combined <- function(views, lab, title = "Combined PCA") {
+  
+  # Combine the three modalities column-wise
+  X_all <- do.call(cbind, views)
+  
+  # Run PCA
+  pca <- prcomp(X_all, scale. = TRUE)
+  
+  # Build data frame for ggplot
+  df <- data.frame(
+    PC1   = pca$x[, 1],
+    PC2   = pca$x[, 2],
+    label = factor(lab)    # ensures cluster labels exist
+  )
+  
+  ggplot(df, aes(x = PC1, y = PC2, color = label)) +
+    geom_point(alpha = 0.7, size = 2) +
+    labs(title = title, color = "Cluster") +
+    theme_minimal()
+}
+
+# Example usage:
+p_combined <- plot_pca_combined(sim$views, sim$labels, "PCA on all modalities")
+p_combined
+```
+
+
+Save this data
+```{r}
+library(tidyverse)
+
+### 1. Build label tibble from sim$labels (factor vector)
+label_tbl <- tibble(
+  ID            = seq_along(sim$labels),
+  final_cluster = sim$labels,
+  subgroup_m1   = sim$labels,
+  subgroup_m2   = sim$labels,
+  subgroup_m3   = sim$labels
+)
+
+# (optional) store back if you want: sim$labels <- label_tbl
+
+### 2. Prefix feature names by modality: m1_, m2_, m3_
+for (m in seq_along(sim$views)) {
+  names(sim$views[[m]]) <- paste0("m", m, "_", names(sim$views[[m]]))
+}
+
+### 3. Wide table with study info + all modalities
+wide_df <- tibble(
+  src_subject_id = sprintf("sub-%04d", label_tbl$ID)
+) %>%
+  bind_cols(label_tbl %>% select(final_cluster, subgroup_m1, subgroup_m2, subgroup_m3)) %>%
+  bind_cols(sim$views) %>%
+  relocate(src_subject_id)
+
+### 4. Meta table (feature-level + study-level)
+meta_features <- bind_rows(
+  lapply(seq_along(sim$views), function(m) {
+    tibble(
+      ElementName = names(sim$views[[m]]),
+      Datatype    = c("m1_questionnaire", "m2_signal", "m3_measure")[m],
+      Modality    = paste0("m", m)
+    )
+  })
+)
+
+meta_study <- tibble(
+  ElementName = c("final_cluster", "subgroup_m1", "subgroup_m2", "subgroup_m3"),
+  Datatype    = "study_info",
+  Modality    = "study_info"
+)
+
+meta_spartan <- bind_rows(meta_study, meta_features) %>%
+  arrange(factor(Modality, levels = c("study_info", "m1", "m2", "m3")),
+          ElementName)
+
+### 5. Shuffle rows (optional but fine)
+set.seed(12345)
+wide_df <- wide_df[sample(nrow(wide_df)), , drop = FALSE]
+row.names(wide_df) <- NULL
+
+### 6. Save to disk
+out <- "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/MultiCluster"
+if (!dir.exists(out)) dir.create(out, recursive = TRUE)
+
+write.csv(wide_df,      file.path(out, "synthetic_multimodal_spartan.csv"),      row.names = FALSE)
+write.csv(meta_spartan, file.path(out, "synthetic_multimodal_spartan_meta.csv"), row.names = FALSE)
+```
+
+
+# Create and load basetable
+
+```{r, tidy=TRUE}
+#Load function
+source("/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/GIT/Scripts/Modules/Basetable/Basetable_function.R")
+
+# Set path to dictionary
+dictionary_DIR <- "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Feature selection/Complete_dictionary.xlsx"
+
+#Set path to data
+data_DIR <- file.path( "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/72662")
+
+timepoint = 'baseline'
+
+#Run basetable function. 
+results <- create_basetable(
+  data_DIR = data_DIR,
+  dictionary_DIR = dictionary_DIR,
+  release = "Amp_scz3",
+  timepoint= "baseline"
+)
+
+data <- results$data
+meta <- results$meta
+
+ 
+results_screening <- create_basetable(
+  data_DIR = data_DIR,
+  dictionary_DIR = dictionary_DIR,
+  release = "Amp_scz3",
+  timepoint= "screening"
+)
+
+data_screening <- results_screening$data
+meta_screening <- results_screening$meta
+
+
+results_month2 <- create_basetable(
+  data_DIR = data_DIR,
+  dictionary_DIR = dictionary_DIR,
+  release = "Amp_scz3",
+  timepoint= "month_2"
+)
+
+data_month2 <- results_month2$data
+meta_moth2 <- results_month2$meta
+
+```
+
+```{r}
+
+## 1. Add any columns that exist only in screening ----------------------------
+new_cols   <- setdiff(names(data_screening), names(data))
+merged_data <- data %>%                     # baseline rows are the backbone
+  left_join(select(data_screening, src_subject_id, all_of(new_cols)),
+            by = "src_subject_id")
+
+## 2. Decide, variable-by-variable, whether to keep baseline or screening -----
+common_vars <- setdiff(intersect(names(data), names(data_screening)),
+                       "src_subject_id")    # overlap apart from the key
+
+# Count how many non-missing / non-empty values each data set has
+baseline_n  <- sapply(common_vars,
+                      function(v) sum(!is.na(data[[v]]) & data[[v]] != ""))
+screening_n <- sapply(common_vars,
+                      function(v) sum(!is.na(data_screening[[v]]) &
+                                      data_screening[[v]] != ""))
+
+vars_take_screening <- names(screening_n)[screening_n > baseline_n]
+
+## 3. Overwrite those columns *row-wise* with screening values ---------------
+if (length(vars_take_screening) > 0) {
+  merged_data[vars_take_screening] <-
+    data_screening %>%
+      select(src_subject_id, all_of(vars_take_screening)) %>%
+      right_join(select(merged_data, src_subject_id), by = "src_subject_id") %>%
+      select(all_of(vars_take_screening))
+}
+
+# merged_data now contains:
+#   • baseline values everywhere baseline is as complete or more complete
+#   • screening values for columns where screening had strictly fewer missing values
+```
+
+### Remove useless columns
+```{r}
+## Remove columns with only 1 unique value
+merged_data <- merged_data[, sapply(merged_data, function(col) length(unique(col))>1)]
+
+## Data preprocessing: Traumatic brain injury
+
+# Combine age with yes or no column to get rid of the Non applicable (-3)
+if("chrtbi_age_inj" %in% colnames(merged_data)){
+  merged_data$chrtbi_age_inj <- paste(merged_data$chrtbi_subject_head_injury, merged_data$chrtbi_subject_age)
+  merged_data$chrtbi_age_inj[merged_data$chrtbi_age_inj=="No NA"] <- "No"
+  merged_data$chrtbi_age_inj[merged_data$chrtbi_age_inj=="NA NA"] <- NA
+}
+
+
+# Combine how many times with yes or no column to get rid of the Non applicable (-3)
+if("chrtbi_ntimes" %in% colnames(merged_data)){
+  merged_data$chrtbi_ntimes <- paste(merged_data$chrtbi_subject_head_injury, merged_data$chrtbi_subject_times)
+  merged_data$chrtbi_ntimes[merged_data$chrtbi_ntimes=="No NA"] <- "No"
+  merged_data$chrtbi_ntimes[merged_data$chrtbi_ntimes=="NA NA"] <- NA
+}
+# Combine how many times with yes or no column to get rid of the Non applicable (-3)
+if("chrtbi_symptoms" %in% colnames(merged_data)){
+  merged_data$chrtbi_symptoms <- paste(merged_data$chrtbi_subject_head_injury, merged_data$chrtbi_subject_symptoms)
+  merged_data$chrtbi_symptoms[merged_data$chrtbi_symptoms=="No NA"] <- "No"
+  merged_data$chrtbi_symptoms[merged_data$chrtbi_symptoms=="NA NA"] <- NA
+}
+# Combine how many times with yes or no column to get rid of the Non applicable (-3)
+if("chrtbi_knockedout" %in% colnames(merged_data)){
+  merged_data$chrtbi_knockedout <- paste(merged_data$chrtbi_subject_head_injury, merged_data$chrtbi_subject_knockedout)
+  merged_data$chrtbi_knockedout[merged_data$chrtbi_knockedout=="No NA"] <- "No"
+  merged_data$chrtbi_knockedout[merged_data$chrtbi_knockedout=="NA NA"] <- NA
+}
+
+#Remove unneeded columns
+if("chrtbi_age_inj" %in% colnames(merged_data)){
+  merged_data <- select(merged_data, -c(chrtbi_subject_head_injury, chrtbi_subject_age, chrtbi_subject_times,
+                                        chrtbi_subject_symptoms, chrtbi_subject_knockedout))
+}
+
+## Include these new variables in the meta data
+
+meta <- rbind(meta, data.frame(
+  ElementName = 'chrtbi_age_inj',
+  Datatype = 'Traumatic Brain Injury',
+  Modality = 'Brain_injury',
+  stringsAsFactors = FALSE
+))
+
+meta <- rbind(meta, data.frame(
+  ElementName = 'chrtbi_ntimes',
+  Datatype = 'Traumatic Brain Injury',
+  Modality = 'Brain_injury',
+  stringsAsFactors = FALSE
+))
+
+meta <- rbind(meta, data.frame(
+  ElementName = 'chrtbi_symptoms',
+  Datatype = 'Traumatic Brain Injury',
+  Modality = 'Brain_injury',
+  stringsAsFactors = FALSE
+))
+
+meta <- rbind(meta, data.frame(
+  ElementName = 'chrtbi_knockedout',
+  Datatype = 'Traumatic Brain Injury',
+  Modality = 'Brain_injury',
+  stringsAsFactors = FALSE
+))
+
+# If variable is about a medication dose, change all -3 and -300 to 0
+# Loop through columns that have 'dose' in their names (case-insensitive)
+for (col in names(merged_data)) {
+  if (grepl("dose", col, ignore.case = TRUE)) {
+    merged_data[[col]][merged_data[[col]] %in% c(-3, -300)] <- 0
+  }
+}
+# Loop through columns that have 'med' in their names (case-insensitive)
+for (col in names(merged_data)) {
+  if (grepl("med", col, ignore.case = TRUE)) {
+    merged_data[[col]][merged_data[[col]] %in% c(-3, -300)] <- 0
+  }
+}
+
+
+# Remove all -3 and -300 when possible
+merged_data[merged_data == -3 | merged_data == -300] <- NA
+
+# names(merged_data)[sapply(merged_data, function(x) any(x %in% c(-3,-300), na.rm=TRUE))] #To test which columns are still containing -3 and -300.
+
+
+```
+
+### Load in sMRI data
+```{r}
+## Left hemisphere
+CT_lh <- read.delim("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/Processed_sMRI/CT_lh_Destrieux_AMPSCZ.txt")
+
+colnames(CT_lh)[1] <- "ID"
+
+## Right hemisphere
+CT_rh <- read.delim("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/Processed_sMRI/CT_rh_Destrieux_AMPSCZ.txt")
+
+colnames(CT_rh)[1] <- "ID"
+
+## Merge hemispheres
+CT <- merge(CT_lh, CT_rh, by="ID")
+
+
+
+# Get subject ID
+CT$src_subject_id <- sub(
+  ".*sub-([A-Z0-9]+)_.*",
+  "\\1",
+  CT$ID
+)
+
+# Get session number
+CT$session <- sub(
+  ".*ses-([0-9]+).*",  # look for "ses-" then capture digits
+  "\\1",               # replace the whole string with what was captured
+  as.character(CT$ID)  # make sure it’s character, not factor
+)
+
+
+
+
+```
+
+Load in information about sessions etc
+```{r}
+image_1 <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/72662/image03/csv/part-00000-086496ab-3643-4363-9d0a-bf4cc1c77e38-c000.csv")
+image_2 <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/72662/image03/csv/part-00001-086496ab-3643-4363-9d0a-bf4cc1c77e38-c000.csv")
+image_3 <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/72662/image03/csv/part-00002-086496ab-3643-4363-9d0a-bf4cc1c77e38-c000.csv")
+image_4 <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/72662/image03/csv/part-00003-086496ab-3643-4363-9d0a-bf4cc1c77e38-c000.csv")
+image_5 <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/72662/image03/csv/part-00004-086496ab-3643-4363-9d0a-bf4cc1c77e38-c000.csv")
+image_6 <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/72662/image03/csv/part-00005-086496ab-3643-4363-9d0a-bf4cc1c77e38-c000.csv")
+image_7 <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/72662/image03/csv/part-00006-086496ab-3643-4363-9d0a-bf4cc1c77e38-c000.csv")
+
+image_info <- rbind(image_1, image_2, image_3, image_4, image_5, image_6, image_7)
+
+image_info <- filter(image_info, image_info$visit == "baseline")
+image_info <- filter(image_info, image_info$scan_type == "MR structural (T1, T2)")
+
+image_info$session <- sub(
+  ".*ses-([0-9]+).*",  # look for "ses-" then capture digits
+  "\\1",               # replace the whole string with what was captured
+  as.character(image_info$image_file)  # make sure it’s character, not factor
+)
+
+
+```
+
+Filter sMRI data based on image_info
+```{r}
+
+CT <- CT %>%
+  semi_join(
+    image_info,
+    by = c("src_subject_id", "session")
+  )
+
+```
+
+
+Merge with rest of data
+```{r}
+# Drop unneeded columns
+to_drop <- c(
+  "ID",
+  "BrainSegVolNotVent.x",
+  "BrainSegVolNotVent.y",
+  "eTIV.x",
+  "eTIV.y",
+  "session"
+)
+CT <- CT[ , !(names(CT) %in% to_drop)]
+
+merged_data_CT <- merged_data %>%
+  left_join(CT, by = "src_subject_id")
+```
+
+Adjust the meta table so it includes the MRI
+```{r}
+
+# figure out which CT columns are missing from meta_
+new_elems <- setdiff(names(CT), meta$ElementName) %>%
+  setdiff(c("src_subject_id"))
+
+# create a little tibble of those
+new_meta <- tibble(
+  ElementName = new_elems,
+  Datatype    = "Cortical Thickness from Freesurfer (sMRI)",
+  Modality    = "sMRI_CT"
+)
+
+# bind it on
+meta_updated <- meta %>%
+  bind_rows(new_meta)
+
+# now merged_meta_updated has all your CT columns,
+# with the right Datatype & Modality for the new ones.
+
+```
+
+
+Load in euler number to check quality
+```{r}
+euler <- read.delim("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/Processed_sMRI/euler_numbers.txt")
+
+# Get subject ID
+euler$src_subject_id <- sub(
+  ".*sub-([A-Z0-9]+)_.*",
+  "\\1",
+  euler$Subject
+)
+
+# Get session number
+euler$session <- sub(
+  ".*ses-([0-9]+).*",  # look for "ses-" then capture digits
+  "\\1",               # replace the whole string with what was captured
+  as.character(euler$Subject)  # make sure it’s character, not factor
+)
+
+
+euler <- euler %>%
+  semi_join(
+    image_info,
+    by = c("src_subject_id", "session")
+  )
+
+euler$mean <- rowMeans(euler[, c("Euler_LH", "Euler_RH")], na.rm = TRUE)
+
+
+```
+
+
+
+### Cognition
+
+#### Histograms before standardizing
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Identify columns
+penncnb_vars <- grep("^cnb", names(merged_data), value = TRUE)
+
+# Convert to numeric safely
+#merged_data[penncnb_vars] <- lapply(merged_data[penncnb_vars], function(x) as.numeric(as.character(x)))
+
+# Reshape to long format
+long_data <- merged_data %>%
+  select(all_of(penncnb_vars)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Plot all histograms in a grid
+ggplot(long_data, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Histograms of CNB Variables",
+       x = "Value", y = "Count")
+
+```
+
+#### Scatter plots
+```{r}
+# Required packages
+library(ggplot2)
+library(Rtsne)
+library(umap)
+library(dplyr)
+library(gridExtra)
+
+# --- Input data ---
+# merged_data: your dataframe
+# penncnb_vars: character vector of variable names
+
+# Subset the numeric data safely and clean
+X <- merged_data %>%
+  select(all_of(penncnb_vars)) %>%
+  filter(if_all(everything(), ~ !is.na(.) & is.finite(.))) %>%  # remove rows with NA/Inf
+  scale() %>%
+  as.data.frame()
+
+# --- PCA ---
+pca_result <- prcomp(X, center = TRUE, scale. = TRUE)
+pca_df <- data.frame(pca_result$x[, 1:2])
+colnames(pca_df) <- c("Dim1", "Dim2")
+
+# --- t-SNE ---
+set.seed(42)
+tsne_result <- Rtsne(X, dims = 2, perplexity = 30, verbose = TRUE, max_iter = 1000)
+tsne_df <- data.frame(tsne_result$Y)
+colnames(tsne_df) <- c("Dim1", "Dim2")
+
+# --- UMAP ---
+set.seed(42)
+umap_result <- umap(X, n_neighbors = 15, min_dist = 0.1)
+umap_df <- data.frame(umap_result$layout)
+colnames(umap_df) <- c("Dim1", "Dim2")
+
+# --- Plotting function ---
+plot_embedding <- function(df, title) {
+  ggplot(df, aes(x = Dim1, y = Dim2)) +
+    geom_point(alpha = 0.6, color = "steelblue") +
+    theme_minimal(base_size = 14) +
+    labs(title = title, x = "Dimension 1", y = "Dimension 2") +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+
+# --- Generate plots ---
+p1 <- plot_embedding(pca_df, "PCA (2D)")
+p2 <- plot_embedding(tsne_df, "t-SNE (2D)")
+p3 <- plot_embedding(umap_df, "UMAP (2D)")
+
+# --- Display side by side using gridExtra ---
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+```{r}
+pairs(merged_data[penncnb_vars],
+      main = "Scatterplot Matrix of penncnb_vars",
+      pch = 1,    # filled circles
+      col = rgb(0, 0, 1, 0.4))  # semi-transparent blue
+```
+
+#### Standardizing using HC
+```{r}
+# Filter HC group
+hc_data <- merged_data[merged_data$phenotype == "HC", ]
+
+# Function to compute z-scores based on HC stats
+z_score_hc <- function(x, varname) {
+  m <- mean(hc_data[[varname]], na.rm = TRUE)
+  s <- sd(hc_data[[varname]], na.rm = TRUE)
+  return((x - m) / s)
+}
+
+# Apply z-scoring to all identified variables
+for (var in penncnb_vars) {
+  merged_data[[var]] <- z_score_hc(merged_data[[var]], var)
+}
+```
+
+#### Histograms after standardizing
+```{r}
+# Print histograms for all variables
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Reshape to long format
+long_data <- merged_data %>%
+  select(all_of(penncnb_vars)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Plot all histograms in a grid
+ggplot(long_data, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Histograms of CNB Variables",
+       x = "Value", y = "Count")
+```
+
+```{r}
+# Required packages
+library(ggplot2)
+library(Rtsne)
+library(umap)
+library(dplyr)
+library(gridExtra)
+
+# --- Input data ---
+# merged_data: your dataframe
+# penncnb_vars: character vector of variable names
+
+# Subset the numeric data safely and clean
+X <- merged_data %>%
+  select(all_of(penncnb_vars)) %>%
+  mutate(across(everything(), as.numeric)) %>%   # ensure all numeric
+  filter(if_all(everything(), ~ !is.na(.) & is.finite(.))) %>%  # remove rows with NA/Inf
+  scale() %>%
+  as.data.frame()
+
+# --- PCA ---
+pca_result <- prcomp(X, center = TRUE, scale. = TRUE)
+pca_df <- data.frame(pca_result$x[, 1:2])
+colnames(pca_df) <- c("Dim1", "Dim2")
+
+# --- t-SNE ---
+set.seed(42)
+tsne_result <- Rtsne(X, dims = 2, perplexity = 30, verbose = TRUE, max_iter = 1000)
+tsne_df <- data.frame(tsne_result$Y)
+colnames(tsne_df) <- c("Dim1", "Dim2")
+
+# --- UMAP ---
+set.seed(42)
+umap_result <- umap(X, n_neighbors = 15, min_dist = 0.1)
+umap_df <- data.frame(umap_result$layout)
+colnames(umap_df) <- c("Dim1", "Dim2")
+
+# --- Plotting function ---
+plot_embedding <- function(df, title) {
+  ggplot(df, aes(x = Dim1, y = Dim2)) +
+    geom_point(alpha = 0.6, color = "steelblue") +
+    theme_minimal(base_size = 14) +
+    labs(title = title, x = "Dimension 1", y = "Dimension 2") +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+
+# --- Generate plots ---
+p1 <- plot_embedding(pca_df, "PCA (2D)")
+p2 <- plot_embedding(tsne_df, "t-SNE (2D)")
+p3 <- plot_embedding(umap_df, "UMAP (2D)")
+
+# --- Display side by side using gridExtra ---
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+
+```{r}
+pairs(merged_data[penncnb_vars],
+      main = "Scatterplot Matrix of penncnb_vars",
+      pch = 1,    # filled circles
+      col = rgb(0, 0, 1, 0.4))  # semi-transparent blue
+```
+
+
+#### Simple cluster for test
+```{r}
+# --- Step 1: Select and clean data ---
+data_to_cluster <- merged_data[, penncnb_vars]
+
+# Keep only numeric columns
+data_to_cluster <- data_to_cluster[, sapply(data_to_cluster, is.numeric)]
+
+# Remove rows with any NA, NaN, or Inf values
+data_to_cluster <- data_to_cluster[complete.cases(data_to_cluster) & 
+                                     apply(data_to_cluster, 1, function(x) all(is.finite(x))), ]
+
+# Check for remaining valid data
+if (nrow(data_to_cluster) == 0) {
+  stop("No valid rows left after cleaning — check your data for missing or non-numeric values.")
+}
+
+# Standardize variables
+data_scaled <- scale(data_to_cluster)
+
+# --- Step 2: Elbow method for optimal k ---
+set.seed(123)
+max_k <- 10
+wss <- numeric(max_k)
+
+for (k in 1:max_k) {
+  km <- kmeans(data_scaled, centers = k, nstart = 25)
+  wss[k] <- km$tot.withinss
+}
+
+elbow_df <- data.frame(k = 1:max_k, wss = wss)
+
+ggplot(elbow_df, aes(x = k, y = wss)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red", size = 2) +
+  labs(title = "Elbow Method for Choosing Optimal Number of Clusters",
+       x = "Number of Clusters (k)",
+       y = "Total Within-Cluster Sum of Squares") +
+  theme_minimal()
+
+# --- Step 3: Run final k-means with chosen k (adjust as needed) ---
+k_optimal <- 3  # <-- change this after viewing the elbow plot
+
+set.seed(123)
+kmeans_result <- kmeans(data_scaled, centers = k_optimal, nstart = 25)
+
+# --- Step 4: Add results and visualize ---
+merged_data$cluster <- NA
+merged_data$cluster[as.numeric(rownames(data_to_cluster))] <- kmeans_result$cluster
+merged_data$cluster <- factor(merged_data$cluster)
+
+# Visualize clusters with PCA
+pca <- prcomp(data_scaled)
+pca_df <- data.frame(pca$x[,1:2], cluster = factor(kmeans_result$cluster))
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "K-Means Clustering Visualization (PCA Projection)") +
+  theme_minimal()
+```
+```{r}
+# Create PCA dataframe using only the cleaned data
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  cluster = factor(kmeans_result$cluster)
+)
+
+# Count cluster sizes
+cluster_sizes <- table(pca_df$cluster)
+pca_df$cluster <- factor(
+  pca_df$cluster,
+  labels = paste0(levels(pca_df$cluster), " (N=", cluster_sizes, ")")
+)
+
+# Create PCA plot with density distributions
+library(ggplot2)
+library(ggExtra)
+
+p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster, fill = cluster)) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(
+    x = paste0("1st principal component (", round(summary(pca)$importance[2,1]*100), "%)"),
+    y = paste0("2nd principal component (", round(summary(pca)$importance[2,2]*100), "%)"),
+    title = "Cluster Distribution in PCA Space"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(), plot.title = element_text(hjust = 0.5))
+
+ggMarginal(p, type = "density", groupColour = TRUE, groupFill = TRUE)
+```
+
+
+
+### Save preprocessed data
+
+```{r}
+#Save complete merged_data. NOTE: Change to merged_data_CT if you want to include MRI
+write_csv(merged_data, '/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/merged_data.csv')
+write_csv(meta, '/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/merged_meta.csv')
+write_csv(data_month2, '/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/data_month2.csv')
+
+```
+
+
+# Test time effect on PSYCHS
+```{r}
+test = merge(data_screening[c('src_subject_id', 'caarms_pos_tot', 'psychs_pos_tot', 'interview_date', 'sips_pos_tot')], data[c('src_subject_id', 'caarms_pos_tot', 'psychs_pos_tot', 'interview_date', 'sips_pos_tot')], by = 'src_subject_id')
+
+test$diff_psychs = test$psychs_pos_tot.x - test$psychs_pos_tot.y
+
+t.test(test$psychs_pos_tot.x, test$psychs_pos_tot.y)
+t.test(test$caarms_pos_tot.x, test$caarms_pos_tot.y)
+t.test(test$sips_pos_tot.x, test$sips_pos_tot.y)
+
+
+
+
+```
+
+
+
+Or if you already run the code with correct variables:
+```{r}
+# Update if needed. 
+merged_data <- read.csv("/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/merged_data.csv")
+
+merged_meta <- read.csv("/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/merged_meta.csv")
+
+```
+
+# Check missingness data
+
+```{r}
+missingness <- merged_data
+
+missingness <- missingness[, colMeans(is.na(missingness)) <= 0.5] # Remove all columns when more than 50% is missing. 
+
+missingness$misscount <- rowSums(is.na(missingness))
+
+hist(missingness$misscount, breaks=100, xlim=c(0,1500))
+```
+
+
+
+Check if there is a balance in symptom severity and amount of missing data
+```{r}
+
+library(ggplot2)
+library(ggpubr)
+
+# Sips pos tot
+ggscatter(missingness, 
+          x           = "sips_pos_tot", 
+          y           = "misscount",
+          alpha       = 0.5,                 # semi-transparent points
+          size        = 2,                   # point size
+          jitter      = TRUE,                # add a little jitter
+          jitter.width= 0.2,                 # jitter only in x
+          add         = "reg.line",          # add regression line
+          add.params  = list(
+            color = "Red",             # line color
+            size  = 1.2                      # line thickness
+          ),
+          conf.int    = TRUE,                # 95% CI band
+          cor.coef    = TRUE,                # show r and p-value
+          cor.method  = "pearson",
+          xlab        = "SIPS Positive Symptoms Total",
+          ylab        = "NA Count",
+          title       = "Scatterplot of Positive Symptoms vs. Missingness\nwith Pearson’s r",
+) +
+  theme_minimal(base_size = 14)
+cor.test(missingness$sips_pos_tot, missingness$misscount)
+
+# caarms_pos_tot 
+ggscatter(missingness, 
+          x           = "caarms_pos_tot", 
+          y           = "misscount",
+          alpha       = 0.5,                 # semi-transparent points
+          size        = 2,                   # point size
+          jitter      = TRUE,                # add a little jitter
+          jitter.width= 0.2,                 # jitter only in x
+          add         = "reg.line",          # add regression line
+          add.params  = list(
+            color = "Red",             # line color
+            size  = 1.2                      # line thickness
+          ),
+          conf.int    = TRUE,                # 95% CI band
+          cor.coef    = TRUE,                # show r and p-value
+          cor.method  = "pearson",
+          xlab        = "CAARMS Positive Symptoms Total",
+          ylab        = "NA Count",
+          title       = "Scatterplot of Positive Symptoms vs. Missingness\nwith Pearson’s r",
+) +
+  theme_minimal(base_size = 14)
+cor.test(missingness$caarms_pos_tot, missingness$misscount)
+
+
+
+# cdss total
+ggscatter(missingness, 
+          x           = "chrcdss_total", 
+          y           = "misscount",
+          alpha       = 0.5,                 # semi-transparent points
+          size        = 2,                   # point size
+          jitter      = TRUE,                # add a little jitter
+          jitter.width= 0.2,                 # jitter only in x
+          add         = "reg.line",          # add regression line
+          add.params  = list(
+            color = "Red",             # line color
+            size  = 1.2                      # line thickness
+          ),
+          conf.int    = TRUE,                # 95% CI band
+          cor.coef    = TRUE,                # show r and p-value
+          cor.method  = "pearson",
+          xlab        = "CDSS Total",
+          ylab        = "NA Count",
+          title       = "Scatterplot of Positive Symptoms vs. Missingness\nwith Pearson’s r",
+) +
+  theme_minimal(base_size = 14)
+cor.test(missingness$chrcdss_total, missingness$misscount)
+
+# BPRS negative symptom total
+ggscatter(missingness, 
+          x           = "chrbprs_negative_symptom_subscale", 
+          y           = "misscount",
+          alpha       = 0.5,                 # semi-transparent points
+          size        = 2,                   # point size
+          jitter      = TRUE,                # add a little jitter
+          jitter.width= 0.2,                 # jitter only in x
+          add         = "reg.line",          # add regression line
+          add.params  = list(
+            color = "Red",             # line color
+            size  = 1.2                      # line thickness
+          ),
+          conf.int    = TRUE,                # 95% CI band
+          cor.coef    = TRUE,                # show r and p-value
+          cor.method  = "pearson",
+          xlab        = "BPRS negative symptom Total",
+          ylab        = "NA Count",
+          title       = "Scatterplot of Negative Symptoms vs. Missingness\nwith Pearson’s r",
+) +
+  theme_minimal(base_size = 14)
+cor.test(missingness$chrbprs_negative_symptom_subscale, missingness$misscount)
+
+```
+
+
+
+# Demographic table
+
+```{r}
+# Source the demographics function
+source("/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/GIT/Scripts/Modules/Demographictable/Demographictable_function.R")
+
+comparison <- 'phenotype'
+
+comparison_labels <- c("CHR" = "CHR", "HC" = "CC")
+
+# Generate summary table
+table <- demographic_table(merged_data, dictionary_DIR, comparison, comparison_labels) 
+
+# Print table
+print(table)
+
+# Save in a word document
+save_as_docx(table, path = "table_output.docx")
+```
+
+
+
+
+# Subgroup comparisons
+
+### Load subgroup data
+```{r}
+
+label_data <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/MultiCluster/discovery_label_data.csv")
+#test_label_data <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/MultiCluster/test_label_data.csv")
+
+#names(test_label_data) = c("X", "src_subject_id", "Cluster_test")
+
+subgroup_data_discovery <- merge(merged_data, label_data, by='src_subject_id')
+#subgroup_data_test  <- merge(merged_data, test_label_data, by='src_subject_id')
+
+```
+
+### Compare with test
+
+Compare how similar the CHR and CC labels are. 
+```{r}
+# install.packages(c("dplyr","tidyr","clue"))
+library(dplyr)
+library(tidyr)
+library(clue)
+
+# 1. Compute CHR‐proportion for each cluster in each dataset
+disc_comp <- subgroup_data_discovery %>%
+  group_by(Cluster) %>%
+  summarize(prop_CHR = mean(phenotype == "CHR")) %>%
+  arrange(Cluster)
+
+test_comp <- subgroup_data_test %>%
+  group_by(Cluster_test) %>%
+  summarize(prop_CHR = mean(phenotype == "CHR")) %>%
+  arrange(Cluster_test)
+
+# 2. Build a cost matrix: |prop_CHR_disc - prop_CHR_test|
+cost_mat <- outer(disc_comp$prop_CHR,
+                  test_comp$prop_CHR,
+                  FUN = function(x, y) abs(x - y))
+
+rownames(cost_mat) <- paste0("D", disc_comp$Cluster)
+colnames(cost_mat) <- paste0("T", test_comp$Cluster_test)
+
+# 3. Solve assignment (minimize total distance)
+assignment <- solve_LSAP(cost_mat)
+
+# 4. Extract matched pairs and their distances
+matched <- data.frame(
+  discovery_cluster = disc_comp$Cluster,
+  test_cluster      = test_comp$Cluster_test[assignment],
+  distance          = cost_mat[cbind(seq_along(assignment), assignment)]
+)
+
+# 5. Compute an overall “average similarity” = 1 – mean(distance)
+overall_similarity <- 1 - mean(matched$distance)
+
+# Print results
+print(matched)
+cat("\nAverage similarity (1 − mean|ΔCHR_prop|):", round(overall_similarity, 3), "\n")
+```
+
+Test similarity in all data
+```{r}
+# install.packages(c("dplyr","tidyr","clue"))
+library(dplyr)
+library(tidyr)
+library(clue)
+
+# 1. Identify feature columns (drop IDs & cluster labels)
+disc_cols <- setdiff(names(subgroup_data_discovery), c("Cluster",    "src_subject_id"))
+test_cols <- setdiff(names(subgroup_data_test),      c("Cluster_test", "src_subject_id"))
+feat_cols <- intersect(disc_cols, test_cols)
+
+# 2. Split into numeric vs categorical
+numeric_cols <- feat_cols[sapply(subgroup_data_discovery[feat_cols], is.numeric)]
+cat_cols     <- setdiff(feat_cols, numeric_cols)
+
+# 3. Numeric summaries: z-score then mean per cluster
+disc_num <- subgroup_data_discovery %>%
+  select(Cluster, all_of(numeric_cols)) %>%
+  mutate(across(all_of(numeric_cols), scale)) %>%
+  group_by(Cluster) %>%
+  summarise(across(all_of(numeric_cols), mean), .groups = "drop")
+
+test_num <- subgroup_data_test %>%
+  select(Cluster_test, all_of(numeric_cols)) %>%
+  mutate(across(all_of(numeric_cols), scale)) %>%
+  group_by(Cluster_test) %>%
+  summarise(across(all_of(numeric_cols), mean), .groups = "drop")
+
+# 4. Categorical summaries: proportion of each level per cluster
+get_cat_props <- function(df, cluster_col) {
+  props_list <- lapply(cat_cols, function(col) {
+    df %>%
+      group_by(across(all_of(cluster_col)), across(all_of(col))) %>%
+      summarise(n = n(), .groups = "drop_last") %>%
+      mutate(prop = n / sum(n)) %>%
+      select(-n) %>%
+      pivot_wider(
+        names_from  = col,
+        values_from = prop,
+        names_prefix = paste0(col, "_")
+      )
+  })
+  Reduce(function(x,y) full_join(x, y, by = cluster_col), props_list)
+}
+
+disc_cat <- get_cat_props(subgroup_data_discovery, "Cluster")
+test_cat <- get_cat_props(subgroup_data_test,      "Cluster_test")
+
+# 5. Combine numeric + categorical profiles
+disc_profile <- left_join(disc_num, disc_cat, by = "Cluster")
+test_profile <- left_join(test_num, test_cat, by = "Cluster_test")
+
+# 6. Align profile columns & build cost matrix of Euclidean distances
+profile_cols <- setdiff(intersect(names(disc_profile), names(test_profile)),
+                        c("Cluster", "Cluster_test"))
+
+cost_mat <- outer(
+  seq_len(nrow(disc_profile)),
+  seq_len(nrow(test_profile)),
+  Vectorize(function(i,j) {
+    sqrt(sum(
+      (disc_profile[i, profile_cols] - test_profile[j, profile_cols])^2,
+      na.rm = TRUE
+    ))
+  })
+)
+rownames(cost_mat) <- paste0("D", disc_profile$Cluster)
+colnames(cost_mat) <- paste0("T", test_profile$Cluster_test)
+
+# 7. Solve assignment & compute similarity
+assignment <- solve_LSAP(cost_mat)
+matched <- data.frame(
+  discovery_cluster = disc_profile$Cluster,
+  test_cluster      = test_profile$Cluster_test[assignment],
+  distance          = cost_mat[cbind(seq_along(assignment), assignment)]
+) %>%
+  mutate(similarity = 1 - distance / max(distance))
+
+# 8. Output
+print(matched)
+cat("Average similarity across matched clusters:", 
+    round(mean(matched$similarity), 3), "\n")
+```
+
+Test similarity in data used for clustering
+```{r}
+final_data <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/MultiCluster/final_data.csv")
+
+# 1. Identify feature columns (drop IDs & cluster labels)
+clustering_vars <- names(final_data)
+feat_cols <- intersect(
+  clustering_vars,
+  intersect(names(subgroup_data_discovery), names(subgroup_data_test))
+)
+
+# 2. Split into numeric vs categorical
+numeric_cols <- feat_cols[sapply(subgroup_data_discovery[feat_cols], is.numeric)]
+cat_cols     <- setdiff(feat_cols, numeric_cols)
+
+# 3. Numeric summaries: z-score then mean per cluster
+disc_num <- subgroup_data_discovery %>%
+  select(Cluster, all_of(numeric_cols)) %>%
+  mutate(across(all_of(numeric_cols), scale)) %>%
+  group_by(Cluster) %>%
+  summarise(across(all_of(numeric_cols), mean), .groups = "drop")
+
+test_num <- subgroup_data_test %>%
+  select(Cluster_test, all_of(numeric_cols)) %>%
+  mutate(across(all_of(numeric_cols), scale)) %>%
+  group_by(Cluster_test) %>%
+  summarise(across(all_of(numeric_cols), mean), .groups = "drop")
+
+# 4. Categorical summaries: proportion of each level per cluster
+get_cat_props <- function(df, cluster_col) {
+  props_list <- lapply(cat_cols, function(col) {
+    df %>%
+      group_by(across(all_of(cluster_col)), across(all_of(col))) %>%
+      summarise(n = n(), .groups = "drop_last") %>%
+      mutate(prop = n / sum(n)) %>%
+      select(-n) %>%
+      pivot_wider(
+        names_from  = col,
+        values_from = prop,
+        names_prefix = paste0(col, "_")
+      )
+  })
+  Reduce(function(x,y) full_join(x, y, by = cluster_col), props_list)
+}
+
+disc_cat <- get_cat_props(subgroup_data_discovery, "Cluster")
+test_cat <- get_cat_props(subgroup_data_test,      "Cluster_test")
+
+# 5. Combine numeric + categorical profiles
+disc_profile <- left_join(disc_num, disc_cat, by = "Cluster")
+test_profile <- left_join(test_num, test_cat, by = "Cluster_test")
+
+# 6. Align profile columns & build cost matrix of Euclidean distances
+profile_cols <- setdiff(intersect(names(disc_profile), names(test_profile)),
+                        c("Cluster", "Cluster_test"))
+
+cost_mat <- outer(
+  seq_len(nrow(disc_profile)),
+  seq_len(nrow(test_profile)),
+  Vectorize(function(i,j) {
+    sqrt(sum(
+      (disc_profile[i, profile_cols] - test_profile[j, profile_cols])^2,
+      na.rm = TRUE
+    ))
+  })
+)
+rownames(cost_mat) <- paste0("D", disc_profile$Cluster)
+colnames(cost_mat) <- paste0("T", test_profile$Cluster_test)
+
+# 7. Solve assignment & compute similarity
+assignment <- solve_LSAP(cost_mat)
+matched <- data.frame(
+  discovery_cluster = disc_profile$Cluster,
+  test_cluster      = test_profile$Cluster_test[assignment],
+  distance          = cost_mat[cbind(seq_along(assignment), assignment)]
+) %>%
+  mutate(similarity = 1 - distance / max(distance))
+
+# 8. Output
+print(matched)
+cat("Average similarity across matched clusters:", 
+    round(mean(matched$similarity), 3), "\n")
+```
+
+
+
+### Compare with CHR label
+```{r}
+# Load required packages
+library(dplyr)
+library(ggplot2)
+
+# 1. Summarize counts of CHR vs HC in each subgroup
+summary_df_discovery <- subgroup_data_discovery %>%
+  count(Cluster, phenotype)
+
+# 2. Perform chi-square test on the 3×2 contingency table
+tbl      <- table(subgroup_data_discovery$Cluster, subgroup_data_discovery$phenotype)
+chisq_res <- chisq.test(tbl)
+pval     <- signif(chisq_res$p.value, 2)
+
+# 3. Grouped bar chart with title and no background grid lines
+ggplot(summary_df_discovery, aes(x = factor(Cluster), y = n, fill = phenotype)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    x     = "Subgroup",
+    y     = "Count",
+    fill  = "Phenotype",
+    title = paste0(
+      "Comparison of CHR vs HC per Subgroup\n",
+      "(Chi-square p = ", pval, ")"
+    )
+  ) +
+  theme_classic() +
+  theme(
+    # Remove any remaining panel lines or grid behind the bars
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# After your ggplot code, just call:
+ggsave(
+  filename = "CHR_vs_HC_by_subgroup.png",   # file name (extension determines format)
+  width    = 8,                             # width in inches
+  height   = 6,                             # height in inches
+  dpi      = 1000                            # resolution
+)
+
+```
+
+Size of each cluster
+```{r}
+
+cluster_summary <- tibble(
+  Cluster = subgroup_data_discovery$Cluster,
+  Label   = subgroup_data_discovery$phenotype         # ← change if your label column has another name
+) %>% 
+  group_by(Cluster) %>% 
+  summarise(
+    Size = n(),
+    CHR_percentage  = sum(Label == "CHR")/Size*100,
+    .groups = "drop"
+  ) %>% 
+  arrange(Cluster)                   # keeps clusters in order
+
+print(cluster_summary)
+```
+
+### Compare with BIPS APS labels
+
+```{r}
+# 1. Summarize counts of CHR vs HC in each subgroup
+subgroup_data_discovery$sips_bips_scr_lifetime <- as.character(subgroup_data_discovery$sips_bips_scr_lifetime)
+summary_df_discovery <- subgroup_data_discovery %>%
+  count(Cluster, sips_bips_scr_lifetime)
+
+# 2. Perform chi-square test on the 3×2 contingency table
+tbl      <- table(subgroup_data_discovery$Cluster, subgroup_data_discovery$sips_bips_scr_lifetime)
+chisq_res <- chisq.test(tbl)
+pval     <- signif(chisq_res$p.value, 2)
+
+# 3. Grouped bar chart with title and no background grid lines
+ggplot(summary_df_discovery, aes(x = factor(Cluster), y = n, fill = sips_bips_scr_lifetime)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    x     = "Subgroup",
+    y     = "Count",
+    fill  = "sips_bips_scr_lifetime",
+    title = paste0(
+      "Comparison of BIPS per Subgroup\n",
+      "(Chi-square p = ", pval, ")"
+    )
+  ) +
+  theme_classic() +
+  theme(
+    # Remove any remaining panel lines or grid behind the bars
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+```{r}
+# 1. Summarize counts of CHR vs HC in each subgroup
+subgroup_data_discovery$sips_aps_scr_lifetime <- as.character(subgroup_data_discovery$sips_aps_scr_lifetime)
+summary_df_discovery <- subgroup_data_discovery %>%
+  count(Cluster, sips_aps_scr_lifetime)
+
+# 2. Perform chi-square test on the 3×2 contingency table
+tbl      <- table(subgroup_data_discovery$Cluster, subgroup_data_discovery$sips_aps_scr_lifetime)
+chisq_res <- chisq.test(tbl)
+pval     <- signif(chisq_res$p.value, 2)
+
+# 3. Grouped bar chart with title and no background grid lines
+ggplot(summary_df_discovery, aes(x = factor(Cluster), y = n, fill = sips_aps_scr_lifetime)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    x     = "Subgroup",
+    y     = "Count",
+    fill  = "sips_aps_scr_lifetime",
+    title = paste0(
+      "Comparison of APS per Subgroup\n",
+      "(Chi-square p = ", pval, ")"
+    )
+  ) +
+  theme_classic() +
+  theme(
+    # Remove any remaining panel lines or grid behind the bars
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+# 1. Summarize counts of CHR vs HC in each subgroup
+subgroup_data_discovery$sips_grd_scr_lifetime <- as.character(subgroup_data_discovery$sips_grd_scr_lifetime)
+summary_df_discovery <- subgroup_data_discovery %>%
+  count(Cluster, sips_grd_scr_lifetime)
+
+# 2. Perform chi-square test on the 3×2 contingency table
+tbl      <- table(subgroup_data_discovery$Cluster, subgroup_data_discovery$sips_grd_scr_lifetime)
+chisq_res <- chisq.test(tbl)
+pval     <- signif(chisq_res$p.value, 2)
+
+# 3. Grouped bar chart with title and no background grid lines
+ggplot(summary_df_discovery, aes(x = factor(Cluster), y = n, fill = sips_grd_scr_lifetime)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    x     = "Subgroup",
+    y     = "Count",
+    fill  = "sips_grd_scr_lifetime",
+    title = paste0(
+      "Comparison of GRD per Subgroup\n",
+      "(Chi-square p = ", pval, ")"
+    )
+  ) +
+  theme_classic() +
+  theme(
+    # Remove any remaining panel lines or grid behind the bars
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### Do some statistic checks for differences in certain variables between groups
+
+Symptoms
+```{r}
+
+# Make sure Cluster is a factor
+subgroup_data_discovery$Cluster <- as.factor(subgroup_data_discovery$Cluster)
+
+# Vector of the numeric variables you want to test
+vars <- c("sips_pos_tot", "caarms_pos_tot", "chrbprs_negative_symptom_subscale")
+
+
+for (v in vars) {
+  cat("===== Variable:", v, "=====\n\n")
+  
+  # 1) Plot
+  p <- ggplot(subgroup_data_discovery, 
+              aes_string(x = "Cluster", y = v, fill = "Cluster")) +
+       geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+       labs(
+         title = paste0("Distribution of ", v, " by Cluster"),
+         x     = "Cluster",
+         y     = v
+       ) +
+       theme_minimal() +
+       theme(legend.position = "none")
+  print(p)
+  
+  # 2) ANOVA + Tukey HSD
+  formula <- as.formula(paste(v, "~ Cluster"))
+  aov_res <- aov(formula, data = subgroup_data_discovery)
+  cat("— One‐way ANOVA —\n")
+  print(summary(aov_res))
+  
+  cat("\n— Tukey HSD post‐hoc —\n")
+  tukey <- TukeyHSD(aov_res, "Cluster", conf.level = 0.95)
+  print(tukey)
+  
+  
+  
+  cat("\n===================================\n\n")
+}
+```
+Comorbidities
+```{r}
+
+# Make sure Cluster is a factor
+subgroup_data_discovery$Cluster <- as.factor(subgroup_data_discovery$Cluster)
+
+# Vector of the numeric variables you want to test
+vars <- c("chrcdss_total", "chrcssrsb_intensity_lifetime", "chroasis_oasis_total10")
+
+for (v in vars) {
+  cat("===== Variable:", v, "=====\n\n")
+  
+  # 1) Plot
+  p <- ggplot(subgroup_data_discovery, 
+              aes_string(x = "Cluster", y = v, fill = "Cluster")) +
+       geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+       labs(
+         title = paste0("Distribution of ", v, " by Cluster"),
+         x     = "Cluster",
+         y     = v
+       ) +
+       theme_minimal() +
+       theme(legend.position = "none")
+  print(p)
+  
+  # 2) ANOVA + Tukey HSD
+  formula <- as.formula(paste(v, "~ Cluster"))
+  aov_res <- aov(formula, data = subgroup_data_discovery)
+  cat("— One‐way ANOVA —\n")
+  print(summary(aov_res))
+  
+  cat("\n— Tukey HSD post‐hoc —\n")
+  tukey <- TukeyHSD(aov_res, "Cluster", conf.level = 0.95)
+  print(tukey)
+  
+  
+  
+  cat("\n===================================\n\n")
+}
+```
+
+
+Clinical
+```{r}
+
+# Make sure Cluster is a factor
+subgroup_data_discovery$Cluster <- as.factor(subgroup_data_discovery$Cluster)
+
+# Vector of the numeric variables you want to test
+vars <- c("chrbprs_activation_subscale", "chrbprs_bprs_total", "chrpss_perceived_stress_scale_total")
+
+for (v in vars) {
+  cat("===== Variable:", v, "=====\n\n")
+  
+  # 1) Plot
+  p <- ggplot(subgroup_data_discovery, 
+              aes_string(x = "Cluster", y = v, fill = "Cluster")) +
+       geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+       labs(
+         title = paste0("Distribution of ", v, " by Cluster"),
+         x     = "Cluster",
+         y     = v
+       ) +
+       theme_minimal() +
+       theme(legend.position = "none")
+  print(p)
+  
+  # 2) ANOVA + Tukey HSD
+  formula <- as.formula(paste(v, "~ Cluster"))
+  aov_res <- aov(formula, data = subgroup_data_discovery)
+  cat("— One‐way ANOVA —\n")
+  print(summary(aov_res))
+  
+  cat("\n— Tukey HSD post‐hoc —\n")
+  tukey <- TukeyHSD(aov_res, "Cluster", conf.level = 0.95)
+  print(tukey)
+  
+  
+  
+  cat("\n===================================\n\n")
+}
+```
+
+### Compare with site
+```{r}
+# Load required packages
+library(dplyr)
+library(ggplot2)
+
+# 1. Summarize counts of CHR vs HC in each subgroup
+summary_df_discovery <- subgroup_data_discovery %>%
+  count(Cluster, Site)
+
+# 2. Perform chi-square test on the 3×2 contingency table
+tbl      <- table(subgroup_data_discovery$Cluster, subgroup_data_discovery$Site)
+chisq_res <- chisq.test(tbl)
+pval     <- signif(chisq_res$p.value, 2)
+
+# 3. Grouped bar chart with title and no background grid lines
+ggplot(summary_df_discovery, aes(x = factor(Cluster), y = n, fill = Site)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    x     = "Subgroup",
+    y     = "Count",
+    fill  = "Site",
+    title = paste0(
+      "Comparison of CHR vs HC per Subgroup\n",
+      "(Chi-square p = ", pval, ")"
+    )
+  ) +
+  theme_classic() +
+  theme(
+    # Remove any remaining panel lines or grid behind the bars
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# After your ggplot code, just call:
+ggsave(
+  filename = "Site_by_subgroup.png",   # file name (extension determines format)
+  width    = 8,                             # width in inches
+  height   = 6,                             # height in inches
+  dpi      = 1000                            # resolution
+)
+
+```
+
+Size of each cluster
+```{r}
+
+cluster_summary <- tibble(
+  Cluster = subgroup_data_discovery$Cluster,
+  Label   = subgroup_data_discovery$Site         # ← change if your label column has another name
+) %>% 
+  group_by(Cluster) %>% 
+  summarise(
+    Size = n(),
+    CHR_percentage  = sum(Label == "CHR")/Size*100,
+    .groups = "drop"
+  ) %>% 
+  arrange(Cluster)                   # keeps clusters in order
+
+print(cluster_summary)
+```
+
+
+
+
+
+
+# Test
+
+
+
+Now the same for test
+```{r}
+# 1. Summarize counts of CHR vs HC in each subgroup
+summary_df_test <- subgroup_data_test %>%
+  count(Cluster_test, phenotype)
+
+# 2. Perform chi-square test on the 3×2 contingency table
+tbl      <- table(subgroup_data_test$Cluster_test, subgroup_data_test$phenotype)
+chisq_res <- chisq.test(tbl)
+pval     <- signif(chisq_res$p.value, 2)
+
+# 3. Grouped bar chart with title and no background grid lines
+ggplot(summary_df_test, aes(x = factor(Cluster_test), y = n, fill = phenotype)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    x     = "Subgroup",
+    y     = "Count",
+    fill  = "Phenotype",
+    title = paste0(
+      "Comparison of CHR vs HC per Subgroup\n",
+      "(Chi-square p = ", pval, ")"
+    )
+  ) +
+  theme_classic() +
+  theme(
+    # Remove any remaining panel lines or grid behind the bars
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())
+```
+
+Size of each cluster
+```{r}
+
+cluster_summary <- tibble(
+  Cluster = subgroup_data_test$Cluster,
+  Label   = subgroup_data_test$phenotype         # ← change if your label column has another name
+) %>% 
+  group_by(Cluster) %>% 
+  summarise(
+    Size = n(),
+    CHR_percentage  = sum(Label == "CHR")/Size*100,
+    .groups = "drop"
+  ) %>% 
+  arrange(Cluster)                   # keeps clusters in order
+
+print(cluster_summary)
+```
+
+
+## Test differences in other variables
+
+Variable:
+```{r}
+aov_1 <- aov()
+```
+
+
+
+
+
