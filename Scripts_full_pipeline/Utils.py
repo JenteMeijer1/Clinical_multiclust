@@ -1035,7 +1035,11 @@ def remove_missing_from_modalities(
 # Log transform
 ##############################################
 
-def auto_power_transform(df: pd.DataFrame, skew_threshold: float = 0.75) -> pd.DataFrame:
+def auto_power_transform(
+    df: pd.DataFrame,
+    skew_threshold: float = 0.75,
+    return_details: bool = False
+) -> pd.DataFrame:
     """
     Applies Yeo-Johnson power transformation to highly skewed numerical columns.
     
@@ -1049,6 +1053,7 @@ def auto_power_transform(df: pd.DataFrame, skew_threshold: float = 0.75) -> pd.D
     df_transformed = df.copy()
     numeric_cols = df_transformed.select_dtypes(include=[np.number]).columns.tolist()
     transformed_cols = []
+    lambda_by_column = {}
 
     for col in numeric_cols:
         col_values = df_transformed[col].dropna()
@@ -1066,8 +1071,57 @@ def auto_power_transform(df: pd.DataFrame, skew_threshold: float = 0.75) -> pd.D
 
             df_transformed[col] = transformed
             transformed_cols.append(col)
+            lambda_by_column[col] = float(pt.lambdas_[0])
 
+    if return_details:
+        details = {
+            "skew_threshold": float(skew_threshold),
+            "transformed_columns": transformed_cols,
+            "lambda_by_column": lambda_by_column
+        }
+        return df_transformed, details
     return df_transformed
+
+
+def apply_power_transform_from_details(
+    df: pd.DataFrame,
+    power_details: dict
+) -> pd.DataFrame:
+    """
+    Apply a previously fitted per-column Yeo-Johnson transform.
+    """
+    if power_details is None:
+        return df.copy()
+
+    transformed = df.copy()
+    lambda_by_column = power_details.get("lambda_by_column", {}) or {}
+
+    for col, lmbda in lambda_by_column.items():
+        if col not in transformed.columns:
+            continue
+        x = transformed[col].astype(float)
+        mask = x.notna()
+        xv = x[mask].to_numpy(dtype=np.float64, copy=True)
+
+        pos = xv >= 0
+        neg = ~pos
+        yv = np.empty_like(xv, dtype=np.float64)
+
+        if abs(lmbda) > 1e-12:
+            yv[pos] = (np.power(xv[pos] + 1.0, lmbda) - 1.0) / lmbda
+        else:
+            yv[pos] = np.log1p(xv[pos])
+
+        if abs(lmbda - 2.0) > 1e-12:
+            yv[neg] = -((np.power(1.0 - xv[neg], 2.0 - lmbda) - 1.0) / (2.0 - lmbda))
+        else:
+            yv[neg] = -np.log1p(-xv[neg])
+
+        x_out = x.to_numpy(dtype=np.float64, copy=True)
+        x_out[mask.to_numpy()] = yv
+        transformed[col] = x_out
+
+    return transformed
 
      
 
@@ -1122,9 +1176,29 @@ def impute_diverse_data(df: pd.DataFrame, subject_id_column: str = 'src_subject_
         df_data[col] = pd.to_datetime(df_data[col], errors='coerce')
         df_data[col] = df_data[col].fillna(pd.Timestamp('1900-01-01'))
 
-    # Apply KNN imputation
-    knn_imputer = KNNImputer(n_neighbors=n_neighbors)
-    df_imputed = pd.DataFrame(knn_imputer.fit_transform(df_data), columns=df_data.columns)
+    # Apply KNN imputation.
+    # keep_empty_features=True preserves columns that are entirely missing in this cohort,
+    # preventing shape mismatches when reconstructing DataFrames.
+    try:
+        knn_imputer = KNNImputer(n_neighbors=n_neighbors, keep_empty_features=True)
+    except TypeError:
+        # Backward compatibility with older sklearn versions.
+        knn_imputer = KNNImputer(n_neighbors=n_neighbors)
+
+    imputed_values = knn_imputer.fit_transform(df_data)
+    if imputed_values.shape[1] != df_data.shape[1]:
+        # Defensive alignment if sklearn drops all-empty columns in older versions.
+        warnings.warn(
+            "KNNImputer returned fewer columns than expected; reintroducing missing columns as NaN "
+            "to preserve training feature schema alignment."
+        )
+        kept_cols = getattr(knn_imputer, "feature_names_in_", None)
+        if kept_cols is None:
+            kept_cols = list(df_data.columns[:imputed_values.shape[1]])
+        tmp = pd.DataFrame(imputed_values, columns=list(kept_cols), index=df_data.index)
+        df_imputed = tmp.reindex(columns=df_data.columns)
+    else:
+        df_imputed = pd.DataFrame(imputed_values, columns=df_data.columns, index=df_data.index)
 
 
     # Reset indexes before concatenation to avoid mismatched shapes
@@ -1184,7 +1258,8 @@ def impute_data(modalities_data: dict, subject_id_column: str = 'src_subject_id'
 def scale_diverse_data (
     df: pd.DataFrame,
     subject_id_column: str = 'src_subject_id',
-    scaler_type: str = 'robust'
+    scaler_type: str = 'robust',
+    return_details: bool = False
 ) -> pd.DataFrame:
     """
     Scales only the continuous numeric columns in a DataFrame while leaving binary/low‐cardinality
@@ -1198,6 +1273,7 @@ def scale_diverse_data (
     
     Returns:
       pd.DataFrame: The DataFrame with continuous numeric columns scaled.
+      If return_details=True, returns (DataFrame, details_dict).
     """
     # Separate the subject identifier column if present.
     if subject_id_column in df.columns:
@@ -1222,8 +1298,30 @@ def scale_diverse_data (
 
     # Make a copy and scale only the continuous numeric columns.
     df_data_scaled = df_data.copy()
+    scaling_details = {}
     for col in numeric_cols:
         df_data_scaled[col] = scaler.fit_transform(df_data[[col]])
+        col_details = {}
+        if scaler_type == 'standard':
+            col_details = {
+                'mean': float(scaler.mean_[0]),
+                'var': float(scaler.var_[0]),
+                'scale': float(scaler.scale_[0])
+            }
+        elif scaler_type == 'minmax':
+            col_details = {
+                'min': float(scaler.min_[0]),
+                'scale': float(scaler.scale_[0]),
+                'data_min': float(scaler.data_min_[0]),
+                'data_max': float(scaler.data_max_[0]),
+                'data_range': float(scaler.data_range_[0])
+            }
+        elif scaler_type == 'robust':
+            col_details = {
+                'center': float(scaler.center_[0]),
+                'scale': float(scaler.scale_[0])
+            }
+        scaling_details[col] = col_details
 
     # Reassemble the final DataFrame with the subject identifier column (if present).
     if subject_ids is not None:
@@ -1231,6 +1329,14 @@ def scale_diverse_data (
     else:
         final_df = df_data_scaled
 
+    if return_details:
+        details = {
+            'scaler_type': scaler_type,
+            'subject_id_column': subject_id_column,
+            'scaled_numeric_columns': numeric_cols,
+            'column_scaler_params': scaling_details
+        }
+        return final_df, details
     return final_df
 
 
@@ -1238,7 +1344,8 @@ def scale_diverse_data (
 def scale_data(
     modalities_data: dict,
     subject_id_column: str = 'src_subject_id',
-    scaler_type: str = 'standard'
+    scaler_type: str = 'standard',
+    return_details: bool = False
     ) -> dict:
     """
     Applies the scale_diverse_data function to each modality DataFrame in the modalities_data dictionary.
@@ -1251,15 +1358,141 @@ def scale_data(
     Returns:
       dict: Dictionary with the same keys as modalities_data, where each DataFrame has its continuous
             numeric columns scaled.
+      If return_details=True, returns (scaled_modalities, details_dict).
     """
     scaled_modalities = {}
+    scaling_details = {}
     for modality, df in modalities_data.items():
-        scaled_modalities[modality] = scale_diverse_data(
-            df,
-            subject_id_column=subject_id_column,
-            scaler_type=scaler_type
-        )
+        if return_details:
+            scaled_df, mod_details = scale_diverse_data(
+                df,
+                subject_id_column=subject_id_column,
+                scaler_type=scaler_type,
+                return_details=True
+            )
+            scaled_modalities[modality] = scaled_df
+            scaling_details[modality] = mod_details
+        else:
+            scaled_modalities[modality] = scale_diverse_data(
+                df,
+                subject_id_column=subject_id_column,
+                scaler_type=scaler_type
+            )
+    if return_details:
+        return scaled_modalities, scaling_details
     return scaled_modalities
+
+
+def apply_scaling_from_details(
+    df: pd.DataFrame,
+    scaling_details: dict,
+    subject_id_column: str = 'src_subject_id'
+) -> pd.DataFrame:
+    """
+    Apply previously fitted per-column scaling parameters to a DataFrame.
+    """
+    if scaling_details is None:
+        return df.copy()
+
+    scaler_type = scaling_details.get('scaler_type', 'robust')
+    scaled_cols = scaling_details.get('scaled_numeric_columns', [])
+    params = scaling_details.get('column_scaler_params', {})
+
+    if subject_id_column in df.columns:
+        subject_ids = df[[subject_id_column]]
+        data = df.drop(columns=[subject_id_column]).copy()
+    else:
+        subject_ids = None
+        data = df.copy()
+
+    for col in scaled_cols:
+        if col not in data.columns:
+            continue
+        col_params = params.get(col, {})
+        vals = data[col].astype(float)
+        if scaler_type == 'standard':
+            denom = col_params.get('scale', 1.0)
+            if abs(denom) < 1e-12:
+                data[col] = 0.0
+            else:
+                data[col] = (vals - col_params.get('mean', 0.0)) / denom
+        elif scaler_type == 'minmax':
+            data[col] = vals * col_params.get('scale', 1.0) + col_params.get('min', 0.0)
+        elif scaler_type == 'robust':
+            denom = col_params.get('scale', 1.0)
+            if abs(denom) < 1e-12:
+                data[col] = 0.0
+            else:
+                data[col] = (vals - col_params.get('center', 0.0)) / denom
+        else:
+            raise ValueError(f"Unsupported scaler_type '{scaler_type}' in scaling details.")
+
+    if subject_ids is not None:
+        return pd.concat([subject_ids, data], axis=1)
+    return data
+
+
+def apply_scaling_to_modalities_from_details(
+    modalities_data: dict,
+    modality_scaling_details: dict,
+    subject_id_column: str = 'src_subject_id'
+) -> dict:
+    out = {}
+    for mod, df_mod in modalities_data.items():
+        out[mod] = apply_scaling_from_details(
+            df_mod,
+            modality_scaling_details.get(mod),
+            subject_id_column=subject_id_column
+        )
+    return out
+
+
+def impute_data_with_reference(
+    modalities_data: dict,
+    reference_modalities: dict,
+    subject_id_column: str = 'src_subject_id',
+    n_neighbors: int = 7
+) -> dict:
+    """
+    Fit KNN imputer per modality on reference (training) data and transform new data.
+    """
+    imputed = {}
+    for modality, df_new in modalities_data.items():
+        if modality not in reference_modalities:
+            raise KeyError(f"Missing imputation reference for modality '{modality}'.")
+
+        df_ref = reference_modalities[modality]
+        df_new_mod = df_new.copy()
+
+        data_only = df_new_mod.drop(columns=[subject_id_column]) if subject_id_column in df_new_mod.columns else df_new_mod
+        all_missing_mask = data_only.isna().all(axis=1)
+        if all_missing_mask.any():
+            df_new_mod = df_new_mod.loc[~all_missing_mask].reset_index(drop=True)
+
+        if subject_id_column in df_new_mod.columns:
+            ids = df_new_mod[[subject_id_column]].reset_index(drop=True)
+            X_new = df_new_mod.drop(columns=[subject_id_column]).copy()
+        else:
+            ids = None
+            X_new = df_new_mod.copy()
+
+        X_ref = df_ref.drop(columns=[subject_id_column]).copy() if subject_id_column in df_ref.columns else df_ref.copy()
+        X_ref = X_ref.replace("nan", np.nan)
+        X_new = X_new.replace("nan", np.nan)
+
+        X_new = X_new.reindex(columns=X_ref.columns)
+        X_ref = X_ref.apply(pd.to_numeric, errors='coerce')
+        X_new = X_new.apply(pd.to_numeric, errors='coerce')
+
+        imputer = KNNImputer(n_neighbors=n_neighbors)
+        imputer.fit(X_ref)
+        X_imp = pd.DataFrame(imputer.transform(X_new), columns=X_ref.columns)
+
+        if ids is not None:
+            imputed[modality] = pd.concat([ids, X_imp], axis=1)
+        else:
+            imputed[modality] = X_imp
+    return imputed
 
 
 
@@ -1941,7 +2174,8 @@ def preprocessing(df,
                   skew_threshold=0.75,
                   scaler_type='robust',
                   modalities=['Internalising', 'Functioning', 'Cognition', 'Detachment', 'Psychoticism'],
-                  impute_parea=False):
+                  impute_parea=False,
+                  export_preprocessing_details=False):
    """
     Preprocess the data by removing high missing data, applying power transformation, dummy coding, scaling, and imputing.
     
@@ -1953,18 +2187,36 @@ def preprocessing(df,
     - row_threshold: Threshold for row missing data.
     - skew_threshold: Threshold for skewness in data.
     - scaler_type: Type of scaler to use ('robust' or 'standard').
-    
+    NOTE: This function also exists in Utils. Duplicated here so if change, please change Utils too. 
     Returns:
     - dict_final: Dictionary containing processed modalities.
     """
    
    
-   df_transformed = auto_power_transform(df, skew_threshold = skew_threshold) # Apply power transformation when data is skewed. 
+   if export_preprocessing_details:
+       df_transformed, power_transform_details = auto_power_transform(
+           df,
+           skew_threshold=skew_threshold,
+           return_details=True
+       ) # Apply power transformation when data is skewed.
+   else:
+       df_transformed = auto_power_transform(df, skew_threshold = skew_threshold) # Apply power transformation when data is skewed.
+       power_transform_details = None
 
 
    df_dummy = dummy_code(df_transformed)
+   dummy_feature_columns = [c for c in df_dummy.columns if c != subject_id_column]
 
-   df_scaled = scale_diverse_data(df_dummy, subject_id_column=subject_id_column, scaler_type = scaler_type) # Scale data with robust scaler
+   if export_preprocessing_details:
+       df_scaled, initial_scaling_details = scale_diverse_data(
+           df_dummy,
+           subject_id_column=subject_id_column,
+           scaler_type=scaler_type,
+           return_details=True
+       )
+   else:
+       df_scaled = scale_diverse_data(df_dummy, subject_id_column=subject_id_column, scaler_type=scaler_type)
+       initial_scaling_details = None
    modal_dict = extract_modalities(meta, df_scaled) # Split data into modalities based on meta
    modal_dict_clean = {modality: modal_dict[modality] for modality in modalities if modality in modal_dict}
 
@@ -1972,9 +2224,9 @@ def preprocessing(df,
    for mod in modal_dict_clean:
        modal_dict_clean[mod][subject_id_column] = df_scaled[subject_id_column].loc[modal_dict_clean[mod].index]
    
+   subjects_to_drop = set()
    if impute_parea is False:
         # Identify any subjects who are entirely missing in any modality, then drop them from all modalities
-        subjects_to_drop = set()
         for modality, df_mod in modal_dict_clean.items():
             # Exclude subject ID column when checking
             data_only = df_mod.drop(columns=[subject_id_column]) if subject_id_column in df_mod.columns else df_mod
@@ -1996,8 +2248,27 @@ def preprocessing(df,
                     .reset_index(drop=True)
                 )
 
-   dict_imputed = impute_data(modal_dict_clean, subject_id_column=subject_id_column) # Impute missing data in each modality using KNN imputation
-   dict_final = scale_data(dict_imputed, subject_id_column=subject_id_column, scaler_type=scaler_type) # Scale data in each modality with robust scaler
+   imputation_reference_modalities = {
+       mod: modal_dict_clean[mod].copy()
+       for mod in modal_dict_clean
+   } if export_preprocessing_details else None
+
+   imputation_n_neighbors = 7
+   dict_imputed = impute_data(
+       modal_dict_clean,
+       subject_id_column=subject_id_column,
+       n_neighbors=imputation_n_neighbors
+   ) # Impute missing data in each modality using KNN imputation
+   if export_preprocessing_details:
+       dict_final, final_scaling_details = scale_data(
+           dict_imputed,
+           subject_id_column=subject_id_column,
+           scaler_type=scaler_type,
+           return_details=True
+       )
+   else:
+       dict_final = scale_data(dict_imputed, subject_id_column=subject_id_column, scaler_type=scaler_type)
+       final_scaling_details = None
    
    # --- Canonical reindex across modalities ---
    id_col = subject_id_column
@@ -2032,5 +2303,682 @@ def preprocessing(df,
        else:
            subject_id_list.append([])
    ae_data = convert_data_for_vae(dict_final, subject_id_column=subject_id_column)
-
+   if export_preprocessing_details:
+       preprocessing_details = {
+           'subject_id_column': subject_id_column,
+           'preprocessing_parameters': {
+               'col_threshold': col_threshold,
+               'row_threshold': row_threshold,
+               'skew_threshold': skew_threshold,
+               'scaler_type': scaler_type,
+               'modalities_requested': list(modalities),
+               'impute_parea': bool(impute_parea)
+           },
+           'subjects_dropped_full_missing_modality': sorted(list(subjects_to_drop)),
+           'power_transform': power_transform_details,
+           'dummy_feature_columns': dummy_feature_columns,
+           'initial_scaling': initial_scaling_details,
+           'imputation_n_neighbors': int(imputation_n_neighbors),
+           'imputation_reference_modalities': imputation_reference_modalities,
+           'final_modality_scaling': final_scaling_details,
+           'modalities_in_output': list(dict_final.keys()),
+           'n_subjects_after_alignment': len(canonical),
+           'canonical_subject_ids': list(canonical),
+           'feature_columns_per_modality': {
+               mod: [c for c in dict_final[mod].columns if c != subject_id_column]
+               for mod in dict_final
+           }
+       }
+       return ae_data, subject_id_list, dict_final, preprocessing_details
    return ae_data, subject_id_list, dict_final
+
+
+def apply_preprocessing_to_new_data(
+    df: pd.DataFrame,
+    meta: pd.DataFrame,
+    preprocessing_details: dict,
+    subject_id_column: str = 'src_subject_id',
+    imputation_mode: str = 'independent'
+):
+    """
+    Apply previously fitted preprocessing (from preprocessing_details) to new data.
+    Returns: ae_data, subject_id_list, dict_final
+    """
+    if preprocessing_details is None:
+        raise ValueError("preprocessing_details is required.")
+
+    params = preprocessing_details.get('preprocessing_parameters', {})
+    modalities = preprocessing_details.get('modalities_in_output') or params.get('modalities_requested', [])
+    impute_parea = bool(params.get('impute_parea', False))
+
+    # 1) Power transform with fitted lambdas
+    df_transformed = apply_power_transform_from_details(
+        df,
+        preprocessing_details.get('power_transform')
+    )
+
+    # 2) Dummy-code and align to training schema
+    df_dummy = dummy_code(df_transformed, subject_id_column=subject_id_column)
+    target_features = list(preprocessing_details.get('dummy_feature_columns', []))
+    if target_features:
+        missing_features = []
+        for col in target_features:
+            if col not in df_dummy.columns:
+                # Keep as NaN so reference-based imputation can recover this feature;
+                # forcing 0 here can create artificial constant columns in validation data.
+                df_dummy[col] = np.nan
+                missing_features.append(col)
+        if missing_features:
+            warnings.warn(
+                f"New data missing {len(missing_features)} training dummy/features; "
+                "filled with NaN and handled during reference-based imputation."
+            )
+        keep_cols = [subject_id_column] + target_features if subject_id_column in df_dummy.columns else target_features
+        df_dummy = df_dummy[[c for c in keep_cols if c in df_dummy.columns]].copy()
+
+    # 3) Apply initial global scaling
+    df_scaled = apply_scaling_from_details(
+        df_dummy,
+        preprocessing_details.get('initial_scaling'),
+        subject_id_column=subject_id_column
+    )
+
+    # 4) Split by modality + reattach IDs
+    modal_dict = extract_modalities(meta, df_scaled, subject_id_column=subject_id_column)
+    modal_dict_clean = {modality: modal_dict[modality] for modality in modalities if modality in modal_dict}
+    for mod in modal_dict_clean:
+        if subject_id_column not in modal_dict_clean[mod].columns and subject_id_column in df_scaled.columns:
+            modal_dict_clean[mod][subject_id_column] = df_scaled[subject_id_column].loc[modal_dict_clean[mod].index]
+
+    # 5) Apply same participant-level missingness rule
+    subjects_to_drop = set()
+    if impute_parea is False:
+        for modality, df_mod in modal_dict_clean.items():
+            data_only = df_mod.drop(columns=[subject_id_column]) if subject_id_column in df_mod.columns else df_mod
+            missing_mask = data_only.isna().all(axis=1)
+            if missing_mask.any() and subject_id_column in df_mod.columns:
+                missing_ids = df_mod.loc[missing_mask, subject_id_column]
+                subjects_to_drop.update(missing_ids.tolist())
+        if subjects_to_drop:
+            for modality in modal_dict_clean:
+                df2 = modal_dict_clean[modality]
+                if subject_id_column in df2.columns:
+                    modal_dict_clean[modality] = (
+                        df2[~df2[subject_id_column].isin(subjects_to_drop)]
+                        .reset_index(drop=True)
+                    )
+
+    # 6) Impute missing values
+    # independent: fit imputer on new cohort only (recommended for cohort comparison)
+    # reference: fit on training (e.g., CHR) and transform new cohort
+    if imputation_mode not in ('independent', 'reference'):
+        raise ValueError("imputation_mode must be either 'independent' or 'reference'.")
+
+    reference_modalities = preprocessing_details.get('imputation_reference_modalities')
+    n_neighbors = int(preprocessing_details.get('imputation_n_neighbors', 7))
+    if imputation_mode == 'reference' and reference_modalities:
+        dict_imputed = impute_data_with_reference(
+            modal_dict_clean,
+            reference_modalities=reference_modalities,
+            subject_id_column=subject_id_column,
+            n_neighbors=n_neighbors
+        )
+    else:
+        if imputation_mode == 'reference' and not reference_modalities:
+            warnings.warn(
+                "Reference imputation requested but no reference modalities found; "
+                "falling back to independent imputation."
+            )
+        dict_imputed = impute_data(
+            modal_dict_clean,
+            subject_id_column=subject_id_column,
+            n_neighbors=n_neighbors
+        )
+
+    # 7) Apply final per-modality scaling and enforce canonical alignment
+    dict_final = apply_scaling_to_modalities_from_details(
+        dict_imputed,
+        modality_scaling_details=preprocessing_details.get('final_modality_scaling', {}),
+        subject_id_column=subject_id_column
+    )
+
+    id_col = subject_id_column
+    mods = [m for m in modalities if m in dict_final]
+    if not mods:
+        raise ValueError("No requested modalities present after preprocessing.")
+    id_lists = {m: dict_final[m][id_col].tolist() for m in mods}
+    shared = set.intersection(*(set(v) for v in id_lists.values()))
+    canonical = [sid for sid in id_lists[mods[0]] if sid in shared]
+
+    for m in mods:
+        dfm = dict_final[m]
+        dict_final[m] = (
+            dfm[dfm[id_col].isin(shared)]
+            .set_index(id_col)
+            .loc[canonical]
+            .reset_index()
+        )
+
+    for m in mods[1:]:
+        assert dict_final[m][id_col].tolist() == dict_final[mods[0]][id_col].tolist(), \
+            f"Subject-ID order mismatch between {mods[0]} and {m}"
+
+    subject_id_list = []
+    for mod in modalities:
+        if mod in dict_final and subject_id_column in dict_final[mod]:
+            subject_id_list.append(dict_final[mod][subject_id_column].tolist())
+        else:
+            subject_id_list.append([])
+    ae_data = convert_data_for_vae(dict_final, subject_id_column=subject_id_column)
+    return ae_data, subject_id_list, dict_final
+
+
+def analyze_cluster_change_over_time(
+    baseline_df,
+    month2_df,
+    labels_df,
+    subject_id_column='src_subject_id',
+    label_col='labels',
+    top_n_features=15,
+):
+    """
+    Compare baseline clustering labels to month_2 by:
+    1) assigning month_2 observations to the nearest baseline cluster centroid,
+    2) summarizing subgroup transition rates,
+    3) estimating within-subject movement in baseline PCA space, and
+    4) summarizing mean feature change per baseline cluster.
+    """
+
+    required_cols = {subject_id_column, label_col}
+    if not required_cols.issubset(labels_df.columns):
+        missing = sorted(required_cols.difference(labels_df.columns))
+        raise KeyError(f"labels_df is missing required columns: {missing}")
+
+    baseline_features = [
+        c for c in baseline_df.columns
+        if c != subject_id_column and c in month2_df.columns
+        and pd.api.types.is_numeric_dtype(baseline_df[c])
+        and pd.api.types.is_numeric_dtype(month2_df[c])
+    ]
+    if not baseline_features:
+        raise ValueError("No shared numeric features found between baseline_df and month2_df.")
+
+    labels_use = (
+        labels_df[[subject_id_column, label_col]]
+        .dropna(subset=[label_col])
+        .drop_duplicates(subset=[subject_id_column])
+        .copy()
+    )
+
+    baseline_use = baseline_df[[subject_id_column] + baseline_features].copy()
+    month2_use = month2_df[[subject_id_column] + baseline_features].copy()
+
+    merged = (
+        labels_use
+        .merge(baseline_use, on=subject_id_column, how='inner')
+        .merge(month2_use, on=subject_id_column, how='inner', suffixes=('_baseline', '_month2'))
+    )
+
+    baseline_cols = [f'{c}_baseline' for c in baseline_features]
+    month2_cols = [f'{c}_month2' for c in baseline_features]
+    merged = merged.dropna(subset=baseline_cols + month2_cols).copy()
+    if merged.empty:
+        raise ValueError("No paired baseline/month_2 rows remain after alignment and NA filtering.")
+
+    X_baseline = merged[baseline_cols].to_numpy(dtype=float)
+    X_month2 = merged[month2_cols].to_numpy(dtype=float)
+
+    scaler = StandardScaler()
+    X_baseline_z = scaler.fit_transform(X_baseline)
+    scale = np.where(np.asarray(scaler.scale_) == 0, 1.0, np.asarray(scaler.scale_))
+    X_month2_z = (X_month2 - np.asarray(scaler.mean_)) / scale
+
+    merged['baseline_cluster'] = merged[label_col].values
+    cluster_order = np.sort(pd.unique(merged['baseline_cluster']))
+
+    centroid_df = (
+        pd.DataFrame(X_baseline_z, columns=baseline_features, index=merged.index)
+        .assign(baseline_cluster=merged['baseline_cluster'].values)
+        .groupby('baseline_cluster')
+        .mean()
+        .reindex(cluster_order)
+    )
+    centroids = centroid_df.to_numpy(dtype=float)
+
+    baseline_cluster_positions = pd.Index(cluster_order).get_indexer(merged['baseline_cluster'])
+    if np.any(baseline_cluster_positions < 0):
+        raise ValueError("Failed to align baseline clusters to centroid order.")
+
+    month2_distances = np.linalg.norm(
+        X_month2_z[:, None, :] - centroids[None, :, :],
+        axis=2
+    )
+    month2_cluster = cluster_order[month2_distances.argmin(axis=1)]
+    merged['month2_cluster'] = month2_cluster
+    merged['switched_cluster'] = merged['baseline_cluster'] != merged['month2_cluster']
+
+    own_baseline_centroids = centroids[baseline_cluster_positions]
+    merged['distance_from_baseline_centroid_baseline'] = np.linalg.norm(
+        X_baseline_z - own_baseline_centroids,
+        axis=1
+    )
+    merged['distance_from_baseline_centroid_month2'] = np.linalg.norm(
+        X_month2_z - own_baseline_centroids,
+        axis=1
+    )
+    merged['distance_change'] = (
+        merged['distance_from_baseline_centroid_month2']
+        - merged['distance_from_baseline_centroid_baseline']
+    )
+
+    pca = PCA(n_components=min(2, len(baseline_features)))
+    baseline_scores = pca.fit_transform(X_baseline_z)
+    month2_scores = pca.transform(X_month2_z)
+    merged['pc1_baseline'] = baseline_scores[:, 0]
+    merged['pc1_month2'] = month2_scores[:, 0]
+    merged['pc1_change'] = merged['pc1_month2'] - merged['pc1_baseline']
+    if baseline_scores.shape[1] > 1:
+        merged['pc2_baseline'] = baseline_scores[:, 1]
+        merged['pc2_month2'] = month2_scores[:, 1]
+
+    delta_df = pd.DataFrame(
+        X_month2_z - X_baseline_z,
+        columns=baseline_features,
+        index=merged.index,
+    )
+    cluster_feature_change = (
+        delta_df.assign(baseline_cluster=merged['baseline_cluster'].values)
+        .groupby('baseline_cluster')
+        .mean()
+        .reindex(cluster_order)
+    )
+
+    transition_counts = pd.crosstab(
+        merged['baseline_cluster'],
+        merged['month2_cluster'],
+        dropna=False
+    ).reindex(index=cluster_order, columns=cluster_order, fill_value=0)
+    transition_pct = transition_counts.div(transition_counts.sum(axis=1), axis=0).fillna(0.0)
+
+    cluster_summary = (
+        merged.groupby('baseline_cluster')
+        .agg(
+            n_subjects=(subject_id_column, 'nunique'),
+            n_switched=('switched_cluster', 'sum'),
+            switch_rate=('switched_cluster', 'mean'),
+            mean_pc1_change=('pc1_change', 'mean'),
+            sd_pc1_change=('pc1_change', 'std'),
+            mean_distance_change=('distance_change', 'mean'),
+            sd_distance_change=('distance_change', 'std'),
+        )
+        .reindex(cluster_order)
+    )
+    cluster_summary['switch_rate'] = cluster_summary['switch_rate'].fillna(0.0)
+
+    feature_rank = cluster_feature_change.abs().max(axis=0).sort_values(ascending=False)
+    top_features = feature_rank.head(min(top_n_features, len(feature_rank))).index.tolist()
+
+    return {
+        'paired_df': merged,
+        'feature_list': baseline_features,
+        'cluster_order': cluster_order,
+        'transition_counts': transition_counts,
+        'transition_pct': transition_pct,
+        'cluster_summary': cluster_summary,
+        'cluster_feature_change': cluster_feature_change,
+        'top_feature_changes': cluster_feature_change.loc[:, top_features],
+        'pca_explained_variance_ratio': pca.explained_variance_ratio_,
+    }
+
+
+def plot_cluster_change_over_time(
+    analysis_results,
+    output_dir=None,
+    prefix='baseline_to_month2',
+):
+    """
+    Visualize how baseline clusters change at month_2 using:
+    - a transition heatmap,
+    - a paired PC1 change plot,
+    - a heatmap of mean standardized feature change.
+    """
+
+    paired_df = analysis_results['paired_df']
+    cluster_order = analysis_results['cluster_order']
+    transition_pct = analysis_results['transition_pct']
+    top_feature_changes = analysis_results['top_feature_changes']
+
+    palette = dict(zip(cluster_order, sns.color_palette(n_colors=len(cluster_order))))
+    figs = {}
+
+    fig1, ax1 = plt.subplots(figsize=(7.5, 6))
+    sns.heatmap(
+        transition_pct,
+        annot=True,
+        fmt='.2f',
+        cmap='Blues',
+        vmin=0,
+        vmax=1,
+        cbar_kws={'label': 'Row proportion'},
+        ax=ax1,
+    )
+    ax1.set_title('Baseline cluster to month_2 transition')
+    ax1.set_xlabel('Assigned cluster at month_2')
+    ax1.set_ylabel('Baseline cluster')
+    fig1.tight_layout()
+    figs['transition_heatmap'] = fig1
+
+    fig2, ax2 = plt.subplots(figsize=(8.5, 6))
+    x_positions = np.array([0, 1])
+    for cluster in cluster_order:
+        subset = paired_df.loc[paired_df['baseline_cluster'] == cluster]
+        color = palette[cluster]
+        for _, row in subset.iterrows():
+            ax2.plot(
+                x_positions,
+                [row['pc1_baseline'], row['pc1_month2']],
+                color=color,
+                alpha=0.12,
+                linewidth=1,
+            )
+        means = subset[['pc1_baseline', 'pc1_month2']].mean()
+        ax2.plot(
+            x_positions,
+            means.values,
+            color=color,
+            linewidth=3,
+            marker='o',
+            label=f'Cluster {cluster} mean',
+        )
+    ax2.set_xticks(x_positions)
+    ax2.set_xticklabels(['Baseline', 'Month 2'])
+    ax2.set_ylabel('PC1 score in baseline feature space')
+    ax2.set_title('Within-subject movement from baseline to month_2')
+    ax2.grid(axis='y', alpha=0.2)
+    ax2.legend(frameon=False)
+    sns.despine(ax=ax2)
+    fig2.tight_layout()
+    figs['pc1_change_plot'] = fig2
+
+    heatmap_width = max(8, 0.45 * max(1, top_feature_changes.shape[1]) + 4)
+    fig3, ax3 = plt.subplots(figsize=(heatmap_width, 4.8))
+    sns.heatmap(
+        top_feature_changes,
+        cmap='coolwarm',
+        center=0,
+        cbar_kws={'label': 'Mean z-scored change (month_2 - baseline)'},
+        ax=ax3,
+    )
+    ax3.set_title('Largest mean feature changes within each baseline cluster')
+    ax3.set_xlabel('Feature')
+    ax3.set_ylabel('Baseline cluster')
+    fig3.tight_layout()
+    figs['feature_change_heatmap'] = fig3
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        fig1.savefig(os.path.join(output_dir, f'{prefix}_transition_heatmap.png'), dpi=300, bbox_inches='tight')
+        fig2.savefig(os.path.join(output_dir, f'{prefix}_pc1_change.png'), dpi=300, bbox_inches='tight')
+        fig3.savefig(os.path.join(output_dir, f'{prefix}_feature_change_heatmap.png'), dpi=300, bbox_inches='tight')
+
+    return figs
+
+
+
+import pandas as pd
+
+def align_month2_dicts_to_clustering_features(
+    dict_final_disc_m2: dict,
+    dict_final_test_m2: dict,
+    final_metrics: dict,
+    subject_id_column: str,
+    modalities: list,
+    verbose: bool = True,
+):
+    """
+    Filters month2 modality dicts so they only include variables that were used in clustering.
+    Uses final_metrics['data'][modality] as the authority for the feature list and order.
+
+    Returns
+    -------
+    dict_final_disc_m2_filt, dict_final_test_m2_filt, report_df
+    """
+
+    if "data" not in final_metrics:
+        raise KeyError("final_metrics must contain key 'data' (a dict of modality->df used for clustering).")
+
+    clustering_dict = final_metrics["data"]
+    report_rows = []
+
+    disc_filt = {}
+    test_filt = {}
+
+    for modality in modalities:
+        if modality not in clustering_dict:
+            raise KeyError(f"Modality '{modality}' not found in final_metrics['data'].")
+
+        if modality not in dict_final_disc_m2:
+            raise KeyError(f"Modality '{modality}' not found in dict_final_disc_m2.")
+        if modality not in dict_final_test_m2:
+            raise KeyError(f"Modality '{modality}' not found in dict_final_test_m2.")
+
+        df_clust = clustering_dict[modality]
+        df_disc = dict_final_disc_m2[modality]
+        df_test = dict_final_test_m2[modality]
+
+        # --- clustering features as authority (and order) ---
+        clust_cols = list(df_clust.columns)
+        if subject_id_column not in clust_cols:
+            raise KeyError(
+                f"subject_id_column='{subject_id_column}' not found in final_metrics['data'][{modality}].columns"
+            )
+
+        clust_feat_cols = [c for c in clust_cols if c != subject_id_column]
+
+        # --- filter month2 disc/test to those features (intersection), preserving clustering order ---
+        disc_present = [c for c in clust_feat_cols if c in df_disc.columns]
+        test_present = [c for c in clust_feat_cols if c in df_test.columns]
+
+        # Extra columns currently in month2 dicts but not used in clustering
+        disc_extra = [c for c in df_disc.columns if c != subject_id_column and c not in clust_feat_cols]
+        test_extra = [c for c in df_test.columns if c != subject_id_column and c not in clust_feat_cols]
+
+        # Missing columns that clustering expects but month2 lacks
+        disc_missing = [c for c in clust_feat_cols if c not in df_disc.columns]
+        test_missing = [c for c in clust_feat_cols if c not in df_test.columns]
+
+        # Build filtered dfs (keep subject id + ordered features)
+        disc_filt[modality] = df_disc[[subject_id_column] + disc_present].copy()
+        test_filt[modality] = df_test[[subject_id_column] + test_present].copy()
+
+        report_rows.append({
+            "modality": modality,
+            "n_clustering_features": len(clust_feat_cols),
+            "n_disc_features_kept": len(disc_present),
+            "n_test_features_kept": len(test_present),
+            "n_disc_extra_dropped": len(disc_extra),
+            "n_test_extra_dropped": len(test_extra),
+            "n_disc_missing_vs_clustering": len(disc_missing),
+            "n_test_missing_vs_clustering": len(test_missing),
+            "disc_missing_examples": disc_missing[:10],
+            "test_missing_examples": test_missing[:10],
+        })
+
+        if verbose:
+            print(f"\n[{modality}]")
+            print(f"  Clustering features: {len(clust_feat_cols)}")
+            print(f"  Disc kept: {len(disc_present)} | dropped extras: {len(disc_extra)} | missing: {len(disc_missing)}")
+            print(f"  Test kept: {len(test_present)} | dropped extras: {len(test_extra)} | missing: {len(test_missing)}")
+
+    report_df = pd.DataFrame(report_rows)
+
+    # Optional: enforce “same feature set in disc and test” per modality
+    # (If you *require* exact equality, you can assert here.)
+    # for modality in modalities:
+    #     disc_feats = [c for c in disc_filt[modality].columns if c != subject_id_column]
+    #     test_feats = [c for c in test_filt[modality].columns if c != subject_id_column]
+    #     assert disc_feats == test_feats, f"Feature mismatch after filtering in modality: {modality}"
+
+    return disc_filt, test_filt, report_df
+
+def apply_preprocessing_to_month2(
+    df: pd.DataFrame,
+    meta: pd.DataFrame,
+    preprocessing_details: dict,
+    subject_id_column: str = 'src_subject_id',
+    imputation_mode: str = 'independent'
+):
+    """
+    Apply baseline-fitted preprocessing to month-2 data.
+    Aligns each modality to the training clustering feature schema before imputation,
+    and preserves columns that are structurally missing at month-2 as NaN.
+    """
+    if preprocessing_details is None:
+        raise ValueError("preprocessing_details is required.")
+
+    params = preprocessing_details.get('preprocessing_parameters', {})
+    modalities = preprocessing_details.get('modalities_in_output') or params.get('modalities_requested', [])
+    impute_parea = bool(params.get('impute_parea', False))
+    training_feature_cols = preprocessing_details.get('feature_columns_per_modality', {})
+
+    df_transformed = apply_power_transform_from_details(
+        df,
+        preprocessing_details.get('power_transform')
+    )
+
+    df_dummy = dummy_code(df_transformed, subject_id_column=subject_id_column)
+    target_features = list(preprocessing_details.get('dummy_feature_columns', []))
+    if target_features:
+        missing_features = []
+        for col in target_features:
+            if col not in df_dummy.columns:
+                df_dummy[col] = np.nan
+                missing_features.append(col)
+        if missing_features:
+            warnings.warn(
+                f"New data missing {len(missing_features)} training dummy/features; "
+                "filled with NaN before modality-level alignment."
+            )
+        keep_cols = [subject_id_column] + target_features if subject_id_column in df_dummy.columns else target_features
+        df_dummy = df_dummy[[c for c in keep_cols if c in df_dummy.columns]].copy()
+
+    df_scaled = apply_scaling_from_details(
+        df_dummy,
+        preprocessing_details.get('initial_scaling'),
+        subject_id_column=subject_id_column
+    )
+
+    modal_dict = extract_modalities(meta, df_scaled, subject_id_column=subject_id_column)
+    modal_dict_clean = {modality: modal_dict[modality] for modality in modalities if modality in modal_dict}
+    for mod in modal_dict_clean:
+        if subject_id_column not in modal_dict_clean[mod].columns and subject_id_column in df_scaled.columns:
+            modal_dict_clean[mod][subject_id_column] = df_scaled[subject_id_column].loc[modal_dict_clean[mod].index]
+
+    all_missing_cols_by_modality = {}
+    for modality, df_mod in modal_dict_clean.items():
+        target_cols = training_feature_cols.get(modality)
+        if not target_cols:
+            target_cols = [c for c in df_mod.columns if c != subject_id_column]
+
+        ids = df_mod[[subject_id_column]].reset_index(drop=True)
+        feature_df = df_mod.drop(columns=[subject_id_column]).copy()
+
+        missing_cols = [c for c in target_cols if c not in feature_df.columns]
+        extra_cols = [c for c in feature_df.columns if c not in target_cols]
+
+        feature_df = feature_df.reindex(columns=target_cols)
+        all_missing_cols = [c for c in target_cols if feature_df[c].isna().all()]
+        all_missing_cols_by_modality[modality] = all_missing_cols
+
+        if missing_cols or extra_cols or all_missing_cols:
+            warnings.warn(
+                f"{modality}: aligned to training schema before imputation "
+                f"(missing={len(missing_cols)}, extra={len(extra_cols)}, all_missing={len(all_missing_cols)})."
+            )
+
+        modal_dict_clean[modality] = pd.concat([ids, feature_df.reset_index(drop=True)], axis=1)
+
+    subjects_to_drop = set()
+    if impute_parea is False:
+        for modality, df_mod in modal_dict_clean.items():
+            data_only = df_mod.drop(columns=[subject_id_column]) if subject_id_column in df_mod.columns else df_mod
+            missing_mask = data_only.isna().all(axis=1)
+            if missing_mask.any() and subject_id_column in df_mod.columns:
+                missing_ids = df_mod.loc[missing_mask, subject_id_column]
+                subjects_to_drop.update(missing_ids.tolist())
+        if subjects_to_drop:
+            for modality in modal_dict_clean:
+                df2 = modal_dict_clean[modality]
+                if subject_id_column in df2.columns:
+                    modal_dict_clean[modality] = (
+                        df2[~df2[subject_id_column].isin(subjects_to_drop)]
+                        .reset_index(drop=True)
+                    )
+
+    if imputation_mode not in ('independent', 'reference'):
+        raise ValueError("imputation_mode must be either 'independent' or 'reference'.")
+
+    reference_modalities = preprocessing_details.get('imputation_reference_modalities')
+    n_neighbors = int(preprocessing_details.get('imputation_n_neighbors', 7))
+    if imputation_mode == 'reference' and reference_modalities:
+        dict_imputed = impute_data_with_reference(
+            modal_dict_clean,
+            reference_modalities=reference_modalities,
+            subject_id_column=subject_id_column,
+            n_neighbors=n_neighbors
+        )
+    else:
+        if imputation_mode == 'reference' and not reference_modalities:
+            warnings.warn(
+                "Reference imputation requested but no reference modalities found; "
+                "falling back to independent imputation."
+            )
+        dict_imputed = impute_data(
+            modal_dict_clean,
+            subject_id_column=subject_id_column,
+            n_neighbors=n_neighbors
+        )
+
+    for modality, cols in all_missing_cols_by_modality.items():
+        if modality in dict_imputed and cols:
+            dict_imputed[modality].loc[:, cols] = np.nan
+
+    dict_final = apply_scaling_to_modalities_from_details(
+        dict_imputed,
+        modality_scaling_details=preprocessing_details.get('final_modality_scaling', {}),
+        subject_id_column=subject_id_column
+    )
+
+    for modality, cols in all_missing_cols_by_modality.items():
+        if modality in dict_final and cols:
+            dict_final[modality].loc[:, cols] = np.nan
+
+    id_col = subject_id_column
+    mods = [m for m in modalities if m in dict_final]
+    if not mods:
+        raise ValueError("No requested modalities present after preprocessing.")
+    id_lists = {m: dict_final[m][id_col].tolist() for m in mods}
+    shared = set.intersection(*(set(v) for v in id_lists.values()))
+    canonical = [sid for sid in id_lists[mods[0]] if sid in shared]
+
+    for m in mods:
+        dfm = dict_final[m]
+        dict_final[m] = (
+            dfm[dfm[id_col].isin(shared)]
+            .set_index(id_col)
+            .loc[canonical]
+            .reset_index()
+        )
+
+    for m in mods[1:]:
+        assert dict_final[m][id_col].tolist() == dict_final[mods[0]][id_col].tolist(), \
+            f"Subject-ID order mismatch between {mods[0]} and {m}"
+
+    subject_id_list = []
+    for mod in modalities:
+        if mod in dict_final and subject_id_column in dict_final[mod]:
+            subject_id_list.append(dict_final[mod][subject_id_column].tolist())
+        else:
+            subject_id_list.append([])
+    ae_data = convert_data_for_vae(dict_final, subject_id_column=subject_id_column)
+    return ae_data, subject_id_list, dict_final

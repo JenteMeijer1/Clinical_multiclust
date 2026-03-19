@@ -1,0 +1,2121 @@
+---
+title: "MultiCluster"
+author: "J. Meijer"
+date: "2025-01-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+
+
+Check for weird numbers:
+- chrfigs_fam_age
+- chrchs_timeslept
+
+
+
+Check if variables with only one option are removed.
+
+
+```{r}
+# Load libraries
+library(flextable)
+library(officer)
+library(dplyr)
+library(readr)
+library(readxl)
+
+```
+
+# Create and load basetable
+
+```{r, tidy=TRUE}
+#Load function
+source("/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/GIT/Scripts/Modules/Basetable/Basetable_function.R")
+
+# Set path to dictionary
+dictionary_DIR <- "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Feature selection/Complete_dictionary.xlsx"
+
+#Set path to data
+data_DIR <- file.path( "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/72662")
+
+timepoint = 'baseline'
+
+#Run basetable function. 
+results <- create_basetable(
+  data_DIR = data_DIR,
+  dictionary_DIR = dictionary_DIR,
+  release = "Amp_scz3",
+  timepoint= "baseline"
+)
+
+data <- results$data
+meta <- results$meta
+
+ 
+results_screening <- create_basetable(
+  data_DIR = data_DIR,
+  dictionary_DIR = dictionary_DIR,
+  release = "Amp_scz3",
+  timepoint= "screening"
+)
+
+data_screening <- results_screening$data
+meta_screening <- results_screening$meta
+
+
+results_month2 <- create_basetable(
+  data_DIR = data_DIR,
+  dictionary_DIR = dictionary_DIR,
+  release = "Amp_scz3",
+  timepoint= "month_2"
+)
+
+data_month2 <- results_month2$data
+meta_moth2 <- results_month2$meta
+
+```
+
+```{r}
+
+## 1. Add any columns that exist only in screening ----------------------------
+new_cols   <- setdiff(names(data_screening), names(data))
+merged_data <- data %>%                     # baseline rows are the backbone
+  left_join(select(data_screening, src_subject_id, all_of(new_cols)),
+            by = "src_subject_id")
+
+## 2. Decide, variable-by-variable, whether to keep baseline or screening -----
+common_vars <- setdiff(intersect(names(data), names(data_screening)),
+                       "src_subject_id")    # overlap apart from the key
+
+# Count how many non-missing / non-empty values each data set has
+baseline_n  <- sapply(common_vars,
+                      function(v) sum(!is.na(data[[v]]) & data[[v]] != ""))
+screening_n <- sapply(common_vars,
+                      function(v) sum(!is.na(data_screening[[v]]) &
+                                      data_screening[[v]] != ""))
+
+vars_take_screening <- names(screening_n)[screening_n > baseline_n]
+
+## 3. Overwrite those columns *row-wise* with screening values ---------------
+if (length(vars_take_screening) > 0) {
+  merged_data[vars_take_screening] <-
+    data_screening %>%
+      select(src_subject_id, all_of(vars_take_screening)) %>%
+      right_join(select(merged_data, src_subject_id), by = "src_subject_id") %>%
+      select(all_of(vars_take_screening))
+}
+
+# merged_data now contains:
+#   • baseline values everywhere baseline is as complete or more complete
+#   • screening values for columns where screening had strictly fewer missing values
+```
+
+### Remove useless columns
+```{r}
+## Remove columns with only 1 unique value
+merged_data <- merged_data[, sapply(merged_data, function(col) length(unique(col))>1)]
+
+## Data preprocessing: Traumatic brain injury
+
+# Combine age with yes or no column to get rid of the Non applicable (-3)
+if("chrtbi_age_inj" %in% colnames(merged_data)){
+  merged_data$chrtbi_age_inj <- paste(merged_data$chrtbi_subject_head_injury, merged_data$chrtbi_subject_age)
+  merged_data$chrtbi_age_inj[merged_data$chrtbi_age_inj=="No NA"] <- "No"
+  merged_data$chrtbi_age_inj[merged_data$chrtbi_age_inj=="NA NA"] <- NA
+}
+
+
+# Combine how many times with yes or no column to get rid of the Non applicable (-3)
+if("chrtbi_ntimes" %in% colnames(merged_data)){
+  merged_data$chrtbi_ntimes <- paste(merged_data$chrtbi_subject_head_injury, merged_data$chrtbi_subject_times)
+  merged_data$chrtbi_ntimes[merged_data$chrtbi_ntimes=="No NA"] <- "No"
+  merged_data$chrtbi_ntimes[merged_data$chrtbi_ntimes=="NA NA"] <- NA
+}
+# Combine how many times with yes or no column to get rid of the Non applicable (-3)
+if("chrtbi_symptoms" %in% colnames(merged_data)){
+  merged_data$chrtbi_symptoms <- paste(merged_data$chrtbi_subject_head_injury, merged_data$chrtbi_subject_symptoms)
+  merged_data$chrtbi_symptoms[merged_data$chrtbi_symptoms=="No NA"] <- "No"
+  merged_data$chrtbi_symptoms[merged_data$chrtbi_symptoms=="NA NA"] <- NA
+}
+# Combine how many times with yes or no column to get rid of the Non applicable (-3)
+if("chrtbi_knockedout" %in% colnames(merged_data)){
+  merged_data$chrtbi_knockedout <- paste(merged_data$chrtbi_subject_head_injury, merged_data$chrtbi_subject_knockedout)
+  merged_data$chrtbi_knockedout[merged_data$chrtbi_knockedout=="No NA"] <- "No"
+  merged_data$chrtbi_knockedout[merged_data$chrtbi_knockedout=="NA NA"] <- NA
+}
+
+#Remove unneeded columns
+if("chrtbi_age_inj" %in% colnames(merged_data)){
+  merged_data <- select(merged_data, -c(chrtbi_subject_head_injury, chrtbi_subject_age, chrtbi_subject_times,
+                                        chrtbi_subject_symptoms, chrtbi_subject_knockedout))
+}
+
+## Include these new variables in the meta data
+
+meta <- rbind(meta, data.frame(
+  ElementName = 'chrtbi_age_inj',
+  Datatype = 'Traumatic Brain Injury',
+  Modality = 'Brain_injury',
+  stringsAsFactors = FALSE
+))
+
+meta <- rbind(meta, data.frame(
+  ElementName = 'chrtbi_ntimes',
+  Datatype = 'Traumatic Brain Injury',
+  Modality = 'Brain_injury',
+  stringsAsFactors = FALSE
+))
+
+meta <- rbind(meta, data.frame(
+  ElementName = 'chrtbi_symptoms',
+  Datatype = 'Traumatic Brain Injury',
+  Modality = 'Brain_injury',
+  stringsAsFactors = FALSE
+))
+
+meta <- rbind(meta, data.frame(
+  ElementName = 'chrtbi_knockedout',
+  Datatype = 'Traumatic Brain Injury',
+  Modality = 'Brain_injury',
+  stringsAsFactors = FALSE
+))
+
+# If variable is about a medication dose, change all -3 and -300 to 0
+# Loop through columns that have 'dose' in their names (case-insensitive)
+for (col in names(merged_data)) {
+  if (grepl("dose", col, ignore.case = TRUE)) {
+    merged_data[[col]][merged_data[[col]] %in% c(-3, -300)] <- 0
+  }
+}
+# Loop through columns that have 'med' in their names (case-insensitive)
+for (col in names(merged_data)) {
+  if (grepl("med", col, ignore.case = TRUE)) {
+    merged_data[[col]][merged_data[[col]] %in% c(-3, -300)] <- 0
+  }
+}
+
+
+# Remove all -3 and -300 when possible
+merged_data[merged_data == -3 | merged_data == -300] <- NA
+data_month2[data_month2 == -3 | data_month2 == -300] <- NA
+
+# names(merged_data)[sapply(merged_data, function(x) any(x %in% c(-3,-300), na.rm=TRUE))] #To test which columns are still containing -3 and -300.
+
+
+```
+
+
+
+### Cognition
+
+#### Standardizing using HC
+```{r}
+
+penncnb_vars <- grep("^cnb", names(merged_data), value = TRUE)
+
+# Filter HC group
+hc_data <- merged_data[merged_data$phenotype == "HC", ]
+
+# Function to compute z-scores based on HC stats
+z_score_hc <- function(x, varname) {
+  m <- mean(hc_data[[varname]], na.rm = TRUE)
+  s <- sd(hc_data[[varname]], na.rm = TRUE)
+  return((x - m) / s)
+}
+
+# Apply z-scoring to all identified variables
+for (var in penncnb_vars) {
+  merged_data[[var]] <- z_score_hc(merged_data[[var]], var)
+}
+```
+
+```{r}
+# Filter HC group
+hc_data_month2 <- data_month2[data_month2$phenotype == "HC", ]
+
+# Function to compute z-scores based on HC stats
+z_score_hc_month2 <- function(x, varname) {
+  m <- mean(hc_data_month2[[varname]], na.rm = TRUE)
+  s <- sd(hc_data_month2[[varname]], na.rm = TRUE)
+  return((x - m) / s)
+}
+
+# Apply z-scoring to all identified variables
+for (var in penncnb_vars) {
+  data_month2[[var]] <- z_score_hc_month2(data_month2[[var]], var)
+}
+```
+
+
+### Save preprocessed data
+
+```{r}
+#Save complete merged_data. NOTE: Change to merged_data_CT if you want to include MRI
+write_csv(merged_data, '/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/merged_data.csv')
+write_csv(meta, '/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/merged_meta.csv')
+write_csv(data_month2, '/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Data/data_month2.csv')
+
+```
+
+# Demographic table full sample
+
+```{r}
+# Source the demographics function
+source("/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/GIT/Scripts/Modules/Demographictable/Demographictable_function.R")
+
+comparison <- 'phenotype'
+
+comparison_labels <- c("CHR" = "CHR", "HC" = "CC")
+
+modality_order <- c(
+  "Demographics",
+  "study_info",
+  "Psychoticism",
+  "Detachment",
+  "Internalising",
+  "Functioning",
+  "Cognition"
+)
+
+# Generate summary table
+table <- demographic_table(merged_data, dictionary_DIR, comparison, comparison_labels, modality_order=modality_order)
+
+# Print table
+print(table)
+
+# Save in a word document
+save_as_docx(table, path = "Dem_table_fullSample.docx")
+```
+
+# Demographic table final sample with comparison between discovery and test
+
+First load in the labels from both discovery and test with subject ids. 
+```{r}
+discovery_labels <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/MultiCluster/discovery_labels.csv")
+test_labels <- read.csv("~/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Code/MultiCluster/test_labels.csv")
+```
+
+Create new column with discovery vs test sample
+```{r}
+data_finalSample = merged_data
+
+data_finalSample$sample <- ifelse(data_finalSample$src_subject_id %in% discovery_labels$src_subject_id, yes="Discovery", no="Test")
+
+data_finalSample <- dplyr::filter(
+  data_finalSample,
+  src_subject_id %in% discovery_labels$src_subject_id |
+    src_subject_id %in% test_labels$src_subject_id
+)
+
+```
+
+
+```{r}
+comparison <- 'sample'
+
+table <- demographic_table(data_finalSample, dictionary_DIR, comparison, modality_order=modality_order)
+
+print(table)
+save_as_docx(table, path = "Dem_table_finalSample.docx")
+
+```
+
+
+# Demographic table labels
+```{r}
+# Merge data
+
+Labels_data_disc <- merge(discovery_labels, merged_data, by='src_subject_id')
+Labels_data_test <- merge(test_labels, merged_data, by='src_subject_id')
+```
+
+## Discovery
+
+```{r}
+# Set path to dictionary
+dictionary_DIR_diff <- "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Feature selection/Complete_dictionary_differences.xlsx"
+
+comparisons <- c(
+  "Psychoticism",
+  "Detachment",
+  "Internalising",
+  "Functioning",
+  "Cognition",
+  "final"
+)
+
+tables <- setNames(
+  lapply(comparisons, function(comp) {
+    demographic_table(Labels_data_disc, dictionary_DIR, comparison = comp, , modality_order=modality_order)
+  }),
+  comparisons
+)
+
+# Put them all into one Word document
+library(officer)
+library(flextable)
+
+doc <- read_docx()
+
+for (comp in names(tables)) {
+  doc <- doc %>%
+    body_add_par(paste0("Demographics by ", comp), style = "heading 1") %>%
+    body_add_flextable(tables[[comp]]) %>%
+    body_add_par("", style = "Normal")
+}
+
+print(doc, target = "demographics_all_comparisons.docx")
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(flextable)
+library(officer)
+
+summarize_differences <- function(df, dictionary_DIR_diff, comparisons,
+                                 comparison_labels_map = list(),
+                                 fdr_alpha = 0.05,
+                                 top_n = NULL,
+                                 keep = c("sig", "all")) {
+
+  keep <- match.arg(keep)
+
+  res_long <- map_dfr(comparisons, function(comp) {
+
+    comp_labels <- comparison_labels_map[[comp]]
+
+    gt <- demographic_table(
+      df, dictionary_DIR_diff,
+      comparison = comp,
+      comparison_labels = comp_labels,
+      return = "gtsummary",
+      modality_order=modality_order
+    )
+
+    tb <- gt$table_body %>%
+      # keep variable rows (labels + levels)
+      filter(row_type %in% c("label", "level")) %>%
+      mutate(
+        comparison = comp,
+        keep_main = !is.na(effect_size)   # only the main row where effect_size is stored
+      ) %>%
+      filter(keep_main) %>%
+      transmute(
+        comparison,
+        variable,
+        label,
+        p = p.value,
+        fdr = suppressWarnings(as.numeric(p.adjust(p.value, method = "fdr"))),
+        effect_size = effect_size
+      )
+
+    if (!is.null(top_n)) {
+      tb <- tb %>%
+        arrange(fdr) %>%
+        slice_head(n = top_n)
+    }
+
+    tb
+  })
+
+  if (keep == "sig") {
+    res_used <- res_long %>%
+      filter(!is.na(fdr)) %>%
+      filter(fdr < fdr_alpha)
+  } else {
+    res_used <- res_long
+  }
+
+  compact <- res_used %>%
+    mutate(
+      cell = ifelse(
+        is.na(fdr),
+        NA_character_,
+        paste0("ES=", effect_size, "; FDR=", format(round(fdr, 3), nsmall = 3))
+      )
+    ) %>%
+    select(label, comparison, cell) %>%
+    distinct() %>%
+    pivot_wider(names_from = comparison, values_from = cell)
+
+  list(
+    long_all = res_long,
+    long_used = res_used,
+    compact = compact
+  )
+}
+
+# ---- Word export (compact table styled similarly to your full tables) ----
+export_compact_to_word <- function(compact_df, file = "differences_summary.docx",
+                                  title = "Differences summary across comparisons") {
+
+  ft <- flextable(compact_df) %>%
+    theme_vanilla() %>%        # clean style close to gtsummary defaults
+    bold(part = "header") %>%
+    autofit() %>%
+    align(align = "left", part = "all") %>%
+    valign(valign = "top", part = "all") %>%
+    set_table_properties(layout = "autofit")
+
+
+  doc <- read_docx() %>%
+    body_add_par(title, style = "heading 1") %>%
+    body_add_flextable(ft) %>%
+    body_add_par("", style = "Normal")
+
+  print(doc, target = file)
+  invisible(file)
+}
+```
+
+```{r}
+comparisons <- c("Psychoticism", "Detachment", "Internalising",
+                 "Functioning", "Cognition", "final")
+
+out <- summarize_differences(
+  Labels_data_disc, dictionary_DIR_diff,
+  comparisons = comparisons,
+  fdr_alpha = 0.05,
+  keep = "all"   # "sig" = only FDR < alpha; "all" = everything
+)
+
+# View
+out$compact
+
+# Export to Word
+export_compact_to_word(out$compact, file = "differences_summary.docx")
+```
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(tibble)
+
+# For two different fill scales in one plot:
+#install.packages("ggnewscale")
+library(ggnewscale)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+parse_fdr_num <- function(x) {
+  if (is.null(x)) return(NA_real_)
+  x <- as.character(x)
+  x <- trimws(x)
+  if (length(x) == 0 || is.na(x) || x == "") return(NA_real_)
+  if (grepl("^<", x)) return(suppressWarnings(as.numeric(sub("^<\\s*", "", x))))
+  if (grepl("^>", x)) return(suppressWarnings(as.numeric(sub("^>\\s*", "", x))))
+  suppressWarnings(as.numeric(x))
+}
+
+# Decide variable type from raw df column
+# - continuous: numeric with >2 unique non-missing values and not just {0,1}
+# - binary: numeric with values subset of {0,1} OR factor/character with exactly 2 observed levels
+# - categorical: factor/character with >=3 observed levels
+detect_var_type <- function(x) {
+  x0 <- x
+  x0 <- x0[!is.na(x0)]
+
+  if (length(x0) == 0) return(NA_character_)
+
+  if (is.numeric(x0)) {
+    u <- sort(unique(x0))
+    if (length(u) <= 2 && all(u %in% c(0, 1))) return("binary")
+    return("continuous")
+  }
+
+  # character/factor/logical treated as categorical/binary
+  if (is.logical(x0)) return("binary")
+
+  xch <- as.character(x0)
+  u <- unique(xch)
+  if (length(u) == 2) return("binary")
+  if (length(u) >= 3) return("categorical")
+
+  # single-level
+  return(NA_character_)
+}
+
+# For binary variables, choose "positive" level for proportion
+# rule: if levels include common positives -> use that; else use the 2nd level
+choose_positive_level <- function(x) {
+  xch <- as.character(x)
+  u <- unique(xch[!is.na(xch)])
+  if (length(u) < 2) return(NA_character_)
+
+  # common positive labels
+  positives <- c("1", "yes", "true", "positive", "present", "high", "case", "chr")
+  ulow <- tolower(u)
+
+  hit <- u[match(TRUE, ulow %in% positives, nomatch = 0)]
+  if (length(hit) >= 1 && !is.na(hit[1])) return(hit[1])
+
+  # otherwise: use the second level in sorted unique values for stability
+  u_sorted <- sort(u)
+  u_sorted[2]
+}
+
+# ----------------------------
+# Build heatmap data (means + proportions + categorical grey, with FDR p-values)
+# ----------------------------
+build_mixed_heatmap_data <- function(df,
+                                     dictionary_DIR,
+                                     comparisons,
+                                     comparison_labels_map = list(),
+                                     include_overall = FALSE,
+                                     scale_continuous_within_variable = TRUE,
+                                     # for binary scale you typically DO NOT want z-scoring:
+                                     scale_binary_within_variable = FALSE) {
+
+  res <- purrr::map_dfr(comparisons, function(comp) {
+
+    if (!comp %in% names(df)) {
+      warning(paste0("Skipping comparison '", comp, "' because column not found in df."))
+      return(tibble())
+    }
+
+    # Prepare comparison factor exactly like demographic_table does
+    df2 <- df
+    df2[[comp]] <- as.character(df2[[comp]])
+    comp_labels <- comparison_labels_map[[comp]]
+    if (!is.null(comp_labels) && length(comp_labels) > 0) {
+      df2[[comp]] <- factor(df2[[comp]], levels = names(comp_labels), labels = comp_labels)
+    } else {
+      df2[[comp]] <- as.factor(df2[[comp]])
+    }
+    df2 <- df2[!is.na(df2[[comp]]), , drop = FALSE]
+
+    grp_levels <- levels(df2[[comp]])
+    if (length(grp_levels) == 0) grp_levels <- sort(unique(as.character(df2[[comp]])))
+
+    # Get p.adjusted (FDR) from your demographic_table output (ensures identical testing pipeline)
+    gt <- demographic_table(
+      df, dictionary_DIR,
+      comparison = comp,
+      comparison_labels = comp_labels,
+      return = "gtsummary"
+    )
+
+    tb <- gt$table_body
+    p_tbl <- tb %>%
+      filter(row_type == "label") %>%
+      transmute(
+        variable,
+        fdr_text = if ("p.adjusted" %in% names(tb)) as.character(p.adjusted) else NA_character_,
+        fdr_num  = if ("p.adjusted" %in% names(tb)) vapply(p.adjusted, parse_fdr_num, numeric(1)) else NA_real_
+      )
+
+    # Use labels from gtsummary (already de-duplicated in your demographic_table)
+    var_labels <- tb %>%
+      filter(row_type == "label") %>%
+      transmute(variable, label = as.character(label))
+
+    vars <- intersect(var_labels$variable, names(df2))
+
+    if (length(vars) == 0) {
+      warning(paste0("Skipping comparison '", comp, "' because none of the gtsummary variables exist as columns in df."))
+      return(tibble())
+    }
+
+    # Build one row per (variable, group)
+    out <- purrr::map_dfr(vars, function(v) {
+      x <- df2[[v]]
+      vt <- detect_var_type(x)
+      if (is.na(vt)) return(tibble())
+
+      # compute per-group value
+      by <- df2[[comp]]
+
+      if (vt == "continuous") {
+        tmp <- tibble(
+          variable = v,
+          group = as.character(by),
+          value = as.numeric(x)
+        ) %>%
+          group_by(variable, group) %>%
+          summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+          mutate(var_type = "continuous")
+
+      } else if (vt == "binary") {
+        if (is.numeric(x)) {
+          tmp <- tibble(
+            variable = v,
+            group = as.character(by),
+            value = as.numeric(x)
+          ) %>%
+            group_by(variable, group) %>%
+            summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%  # mean of 0/1 = proportion
+            mutate(var_type = "binary")
+        } else {
+          pos <- choose_positive_level(x)
+          tmp <- tibble(
+            variable = v,
+            group = as.character(by),
+            value = as.character(x)
+          ) %>%
+            group_by(variable, group) %>%
+            summarise(value = mean(value == pos, na.rm = TRUE), .groups = "drop") %>%
+            mutate(var_type = "binary")
+        }
+
+      } else { # categorical (>=3 levels)
+        # We still want tiles + p-values, but no mean/proportion color
+        tmp <- tibble(
+          variable = v,
+          group = grp_levels
+        ) %>%
+          mutate(value = NA_real_, var_type = "categorical")
+      }
+
+      tmp
+    })
+
+    if (nrow(out) == 0) return(tibble())
+
+    out %>%
+      left_join(var_labels, by = "variable") %>%
+      left_join(p_tbl, by = "variable") %>%
+      mutate(
+        comparison = comp,
+        # group index (k) based on factor level order in df2
+        k = match(group, grp_levels),
+        x = paste0(comp, " | ", group)
+      ) %>%
+      select(comparison, x, k, variable, label, var_type, value, fdr_text, fdr_num)
+  })
+
+  if (nrow(res) == 0) {
+    warning("No heatmap data produced.")
+    return(res)
+  }
+
+  # Create plotting values:
+  # - continuous: optionally z-score within variable
+  # - binary: keep as proportion (0-1) unless explicitly scaled
+  # - categorical: NA (will be grey)
+  res <- res %>%
+    group_by(label) %>%
+    mutate(
+      value_plot_cont = ifelse(var_type == "continuous",
+                               if (scale_continuous_within_variable) as.numeric(scale(value)) else value,
+                               NA_real_),
+      value_plot_bin  = ifelse(var_type == "binary",
+                               if (scale_binary_within_variable) as.numeric(scale(value)) else value,
+                               NA_real_)
+    ) %>%
+    ungroup()
+
+  res
+}
+
+# ----------------------------
+# Spacers between modalities
+# ----------------------------
+add_modality_spacers <- function(heat_df, spacer_suffix = " ") {
+  df <- heat_df %>%
+    mutate(modality = trimws(sub("\\|.*$", "", as.character(x))))
+
+  modalities <- unique(df$modality)
+  if (length(modalities) <= 1) return(df)
+
+  spacers <- purrr::map_dfr(modalities[-length(modalities)], function(m) {
+    df %>%
+      filter(modality == m) %>%
+      distinct(label) %>%
+      transmute(
+        comparison = NA_character_,
+        x = paste0(m, spacer_suffix),
+        k = NA_integer_,
+        variable = NA_character_,
+        label = label,
+        var_type = "spacer",
+        value = NA_real_,
+        fdr_text = NA_character_,
+        fdr_num = NA_real_,
+        value_plot_cont = NA_real_,
+        value_plot_bin = NA_real_
+      )
+  })
+
+  bind_rows(df, spacers)
+}
+
+order_x_with_spacers <- function(heat_df, spacer_suffix = " ") {
+  df <- heat_df %>%
+    mutate(
+      x_chr = as.character(x),
+      is_spacer = var_type == "spacer" | (is.na(value) & grepl(paste0(spacer_suffix, "$"), x_chr)),
+      modality = trimws(sub("\\|.*$", "", x_chr))
+    )
+
+  base_x <- df %>% filter(!is_spacer) %>% distinct(x_chr, modality)
+  modality_order <- base_x$modality[!duplicated(base_x$modality)]
+
+  x_levels <- unlist(lapply(modality_order, function(m) {
+    xs <- base_x$x_chr[base_x$modality == m]
+    c(xs, paste0(m, spacer_suffix))
+  }))
+  x_levels <- x_levels[x_levels != paste0(modality_order[length(modality_order)], spacer_suffix)]
+
+  df %>%
+    mutate(x = factor(x_chr, levels = x_levels)) %>%
+    select(-x_chr, -is_spacer, -modality)
+}
+
+
+```
+
+```{r}
+export_heatmap <- function(plot_obj, heat_df,
+                           file = "heatmap_group_means.svg",
+                           dpi = 300,
+                           width = NULL, height = NULL,
+                           units = "in") {
+
+  n_rows <- dplyr::n_distinct(heat_df$label)
+  n_cols <- dplyr::n_distinct(heat_df$x)
+
+  # Heuristic sizing if not provided
+  if (is.null(width))  width  <- max(12, n_cols * 0.6)
+  if (is.null(height)) height <- max(8,  n_rows * 0.22)
+
+  ggsave(
+    filename = file,
+    plot = plot_obj,
+    width = width,
+    height = height,
+    units = units,
+    dpi = dpi,
+    limitsize = FALSE
+  )
+
+  message("Saved: ", file, " (", width, " x ", height, " ", units, ", dpi=", dpi, ")")
+}
+
+```
+
+```{r}
+comparisons <- c("Psychoticism","Detachment","Internalising","Functioning","Cognition","final")
+
+heat_df <- build_mixed_heatmap_data(
+  Labels_data_disc, dictionary_DIR_diff,
+  comparisons = comparisons,
+  comparison_labels_map = list(),
+  include_overall = FALSE,
+  scale_continuous_within_variable = TRUE,
+  scale_binary_within_variable = FALSE
+)
+
+heat_df_spaced <- heat_df %>%
+  add_modality_spacers() %>%
+  order_x_with_spacers()
+
+
+```
+
+```{r}
+add_x_positions_with_gaps <- function(df, gap_size = 0.25, step_size = 1) {
+  # df$x must be a factor with levels in plotting order
+  lv <- levels(df$x)
+  if (is.null(lv)) stop("df$x must be a factor with levels set.")
+
+  # your real columns look like "Modality | group"
+  is_real <- grepl("\\|", lv)
+  is_spacer <- !is_real
+
+  pos <- numeric(length(lv))
+  cur <- 0
+  for (i in seq_along(lv)) {
+    if (is_spacer[i]) {
+      cur <- cur + gap_size
+    } else {
+      cur <- cur + step_size
+    }
+    pos[i] <- cur
+  }
+
+  map <- tibble::tibble(x = factor(lv, levels = lv), x_pos = pos, is_real = is_real)
+  df %>% dplyr::left_join(map, by = "x")
+}
+
+heat_df_spaced <- heat_df_spaced %>%
+  add_x_positions_with_gaps(gap_size = 0.20)  # <- make this smaller/larger
+```
+
+
+```{r}
+plot_mixed_heatmap_split <- function(heat_df,
+                                     dictionary_DIR,
+
+                                     # overall (patchwork) title + size
+                                     title = "Heatmaps by variable type",
+                                     overall_title_size = 14,
+
+                                     # x-axis title (optionally shown per panel) + size
+                                     x_title = "Modality | group",
+                                     x_title_size = 10,
+                                     show_x_title_on = c("cat"), # any of c("cont","bin","cat")
+
+                                     # panel subtitles (each plot title) + size (per panel)
+                                     cont_subtitle = "Continuous (means)",
+                                     bin_subtitle  = "Binary (proportions)",
+                                     cat_subtitle  = "Categorical (neutral tiles; p-values shown)",
+                                     cont_subtitle_size = 12,
+                                     bin_subtitle_size  = 12,
+                                     cat_subtitle_size  = 12,
+
+                                     # axis text sizes
+                                     x_text_size = 8,
+                                     y_text_size = 8,
+
+                                     # header + variable label sizes on y-axis (ggtext markdown)
+                                     header_text_size = 13,
+                                     var_text_size    = NULL,   # defaults to y_text_size
+
+                                     # legend titles + sizes (per panel) and legend text sizes (per panel)
+                                     legend_title_cont = "Mean",
+                                     legend_title_bin  = "Prop",
+                                     legend_title_size_cont = 11,
+                                     legend_text_size_cont  = 10,
+                                     legend_title_size_bin  = 11,
+                                     legend_text_size_bin   = 10,
+
+                                     # legend key sizing
+                                     legend_key_height = grid::unit(0.5, "cm"),
+                                     legend_key_width  = grid::unit(0.35, "cm"),
+
+                                     # p-value annotation controls + size
+                                     annotate_p = TRUE,
+                                     p_text_size = 2.4,
+                                     alpha_sig = 0.05,
+
+                                     # colours
+                                     categorical_grey = "grey85",
+
+                                     # modality ordering for header blocks
+                                     modality_order = c("Psychoticism",
+                                                        "Detachment",
+                                                        "Internalising",
+                                                        "Functioning",
+                                                        "Cognition",
+                                                        "Demographics",
+                                                        "Study_info")) {
+
+  # ---- deps ----
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Need package: dplyr")
+  if (!requireNamespace("ggplot2", quietly = TRUE)) stop("Need package: ggplot2")
+  if (!requireNamespace("patchwork", quietly = TRUE)) stop("Need package: patchwork")
+  if (!requireNamespace("shadowtext", quietly = TRUE)) stop("Need package: shadowtext")
+  if (!requireNamespace("RColorBrewer", quietly = TRUE)) stop("Need package: RColorBrewer")
+  if (!requireNamespace("readxl", quietly = TRUE)) stop("Need package: readxl")
+  if (!requireNamespace("tidyr", quietly = TRUE)) stop("Need package: tidyr")
+  if (!requireNamespace("tibble", quietly = TRUE)) stop("Need package: tibble")
+  if (!requireNamespace("ggtext", quietly = TRUE)) stop("Need package: ggtext")
+  if (!requireNamespace("grid", quietly = TRUE)) stop("Need package: grid")
+
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+  library(shadowtext)
+
+  if (is.null(var_text_size)) var_text_size <- y_text_size
+  show_x_title_on <- intersect(show_x_title_on, c("cont", "bin", "cat"))
+
+  # ensure x is a factor (your ordering/spacers should already be baked into levels)
+  if (!is.factor(heat_df$x)) heat_df <- heat_df %>% mutate(x = factor(x))
+
+  # If you added numeric x positions (to shrink spacer gaps), we use them.
+  use_xpos <- "x_pos" %in% names(heat_df)
+  if (use_xpos && !is.numeric(heat_df$x_pos)) {
+    stop("heat_df$x_pos exists but is not numeric. Recompute x_pos as numeric.")
+  }
+
+  # label x only for real columns "Modality | group" (hide spacer ticks)
+  x_labeler <- function(lv) ifelse(grepl("\\|", lv), lv, "")
+
+  # breaks/labels for numeric x axis (label only real columns; spacers unlabeled)
+  if (use_xpos) {
+    x_breaks <- heat_df %>% distinct(x, x_pos) %>% arrange(x_pos)
+    x_breaks_real <- x_breaks %>% filter(grepl("\\|", as.character(x)))
+    breaks_vec <- x_breaks_real$x_pos
+    labels_vec <- as.character(x_breaks_real$x)
+  }
+
+  # ---- dictionary mapping: variable -> Modality + dict row + ElementName (short y label) ----
+  dict <- readxl::read_excel(dictionary_DIR)
+  req <- c("ElementName", "Modality", "Aliases")
+  miss <- setdiff(req, names(dict))
+  if (length(miss) > 0) stop("Dictionary is missing columns: ", paste(miss, collapse = ", "))
+
+  dict <- dict %>%
+    mutate(
+      .dict_row   = dplyr::row_number(),
+      ElementName = as.character(ElementName),
+      Modality    = as.character(Modality),
+      Aliases     = as.character(Aliases)
+    )
+
+  split_aliases <- function(x) {
+    if (is.na(x) || !nzchar(x)) return(character(0))
+    toks <- unlist(strsplit(x, "[;\\|,\\n\\r]+", perl = TRUE))
+    toks <- trimws(toks)
+    toks <- toks[nzchar(toks)]
+    unique(toks)
+  }
+
+  element_tbl <- dict %>%
+    transmute(key = ElementName, Modality, .dict_row, .prio = 1L) %>%
+    filter(!is.na(key) & key != "")
+
+  alias_tbl <- dict %>%
+    transmute(Modality, .dict_row, alias_vec = lapply(Aliases, split_aliases)) %>%
+    tidyr::unnest(alias_vec) %>%
+    transmute(key = as.character(alias_vec), Modality, .dict_row, .prio = 2L) %>%
+    filter(!is.na(key) & key != "")
+
+  lookup_raw <- bind_rows(element_tbl, alias_tbl)
+
+  vars_present <- heat_df %>%
+    filter(!is.na(variable) & variable != "") %>%
+    distinct(variable) %>%
+    pull(variable) %>%
+    as.character()
+
+  matches <- tibble::tibble(variable = vars_present) %>%
+    left_join(lookup_raw, by = c("variable" = "key"))
+
+  # pick best match per variable: ElementName match preferred, then alias,
+  # within that first occurrence in dict
+  best <- matches %>%
+    filter(!is.na(Modality)) %>%
+    arrange(variable, .prio, .dict_row) %>%
+    group_by(variable) %>%
+    slice(1) %>%
+    ungroup() %>%
+    left_join(dict %>% transmute(.dict_row, ElementName), by = ".dict_row")
+
+  var_map <- tibble::tibble(variable = vars_present) %>%
+    left_join(best %>% select(variable, Modality, .dict_row, ElementName), by = "variable") %>%
+    mutate(
+      Modality      = ifelse(is.na(Modality) | Modality == "", "Other / Unmapped", Modality),
+      .dict_row     = ifelse(is.na(.dict_row), Inf, .dict_row),
+      element_short = ifelse(is.na(ElementName) | ElementName == "", variable, ElementName)
+    ) %>%
+    select(variable, Modality, .dict_row, element_short)
+
+  df0 <- heat_df %>%
+    left_join(var_map, by = "variable") %>%
+    mutate(
+      Modality      = ifelse(is.na(Modality) | Modality == "", "Other / Unmapped", Modality),
+      .dict_row     = ifelse(is.na(.dict_row), Inf, .dict_row),
+      element_short = ifelse(is.na(element_short) | element_short == "", variable, element_short)
+    )
+
+  # ---- build header rows + variable rows, with bold headers ----
+  build_blocked_df <- function(df_type) {
+
+    mods_in_panel <- df_type %>%
+      filter(!is.na(variable) & variable != "") %>%
+      distinct(Modality) %>%
+      pull(Modality)
+
+    mods_present <- c(modality_order, setdiff(mods_in_panel, modality_order))
+    mods_present <- c(setdiff(mods_present, "Other / Unmapped"),
+                      intersect(mods_present, "Other / Unmapped"))
+
+    ord <- df_type %>%
+      filter(!is.na(variable) & variable != "") %>%
+      distinct(variable, label, element_short, Modality, .dict_row) %>%
+      mutate(
+        Modality = factor(Modality, levels = mods_present),
+        .mod_rank = match(as.character(Modality), mods_present)
+      ) %>%
+      arrange(.mod_rank, .dict_row, element_short, variable)
+
+    # x levels depend on whether we use factor-x or numeric-x (still keep factor for ordering)
+    x_levels <- levels(df_type$x)
+    k_levels <- sort(unique(df_type$k))
+
+    header_rows <- ord %>%
+      distinct(Modality) %>%
+      mutate(
+        y_id = paste0("##", as.character(Modality)),
+        variable = NA_character_,
+        label = as.character(Modality),
+        y_disp = as.character(Modality),
+        .dict_row = -Inf
+      ) %>%
+      tidyr::crossing(x = factor(x_levels, levels = x_levels)) %>%
+      tidyr::crossing(k = k_levels) %>%
+      mutate(
+        comparison = df_type$comparison[1],
+        var_type = df_type$var_type[1],
+        value = NA_real_,
+        fdr_text = NA_character_,
+        fdr_num = NA_real_,
+        value_plot_cont = NA_real_,
+        value_plot_bin  = NA_real_,
+        x_pos = if (use_xpos) NA_real_ else NULL
+      )
+
+    real_rows <- df_type %>%
+      mutate(
+        y_id   = paste0(as.character(Modality), "__", as.character(variable)),
+        y_disp = element_short
+      )
+
+    # y order: headers then variables within each modality
+    y_levels <- c()
+    for (m in mods_present) {
+      vars_m <- ord %>% filter(as.character(Modality) == m)
+      if (nrow(vars_m) == 0) next
+      y_levels <- c(y_levels,
+                    paste0("##", m),
+                    paste0(m, "__", vars_m$variable))
+    }
+
+    out <- bind_rows(real_rows, header_rows) %>%
+      mutate(y_id = factor(y_id, levels = rev(unique(y_levels))))
+
+    y_map <- out %>%
+      distinct(y_id, y_disp) %>%
+      mutate(y_id_chr = as.character(y_id)) %>%
+      { setNames(.$y_disp, .$y_id_chr) }
+
+    y_lab <- function(vals) {
+      vals_chr <- as.character(vals)
+      is_header <- startsWith(vals_chr, "##")
+      raw <- unname(y_map[vals_chr])
+
+      header_html <- paste0(
+        "<span style='font-size:", header_text_size, "pt; font-weight:800;'><b>",
+        raw,
+        "</b></span>"
+      )
+      var_html <- paste0(
+        "<span style='font-size:", var_text_size, "pt;'>&nbsp;&nbsp;&nbsp;",
+        raw,
+        "</span>"
+      )
+
+      ifelse(is_header, header_html, var_html)
+    }
+
+    list(df = out, y_labeler = y_lab)
+  }
+
+  df_cont0 <- df0 %>% filter(var_type == "continuous")
+  df_bin0  <- df0 %>% filter(var_type == "binary")
+  df_cat0  <- df0 %>% filter(var_type == "categorical")
+
+  cont_pack <- build_blocked_df(df_cont0)
+  bin_pack  <- build_blocked_df(df_bin0)
+  cat_pack  <- build_blocked_df(df_cat0)
+
+  df_cont <- cont_pack$df
+  df_bin  <- bin_pack$df
+  df_cat  <- cat_pack$df
+
+  # if using numeric x, make sure header rows got x_pos too (join via x)
+  if (use_xpos) {
+    x_map_all <- df0 %>% distinct(x, x_pos)
+    df_cont <- df_cont %>% left_join(x_map_all, by = "x", suffix = c("", ".map")) %>%
+      mutate(x_pos = dplyr::coalesce(x_pos, x_pos.map)) %>% select(-x_pos.map)
+    df_bin  <- df_bin  %>% left_join(x_map_all, by = "x", suffix = c("", ".map")) %>%
+      mutate(x_pos = dplyr::coalesce(x_pos, x_pos.map)) %>% select(-x_pos.map)
+    df_cat  <- df_cat  %>% left_join(x_map_all, by = "x", suffix = c("", ".map")) %>%
+      mutate(x_pos = dplyr::coalesce(x_pos, x_pos.map)) %>% select(-x_pos.map)
+  }
+
+  n_cont <- max(1, dplyr::n_distinct(df_cont$y_id))
+  n_bin  <- max(1, dplyr::n_distinct(df_bin$y_id))
+  n_cat  <- max(1, dplyr::n_distinct(df_cat$y_id))
+
+  # ---- annotations (stars on k==1, p text on k==2), skip headers ----
+  base_ann <- df0 %>%
+    filter(k == 1) %>%
+    filter(!is.na(fdr_text) & fdr_text != "") %>%
+    mutate(
+      sig_stars = dplyr::case_when(
+        grepl("^\\s*<\\s*0\\.001\\s*$", fdr_text) ~ "***",
+        !is.na(fdr_num) & fdr_num < 0.001 ~ "***",
+        !is.na(fdr_num) & fdr_num < 0.01  ~ "**",
+        !is.na(fdr_num) & fdr_num < 0.05  ~ "*",
+        TRUE ~ ""
+      ),
+      y_id = paste0(as.character(Modality), "__", as.character(variable))
+    )
+
+  map_k2 <- df0 %>%
+    filter(k == 2) %>%
+    mutate(y_id = paste0(as.character(Modality), "__", as.character(variable))) %>%
+    distinct(comparison, y_id, x)
+
+  ann_k1 <- base_ann %>%
+    transmute(comparison, x, y_id, ann_label = sig_stars) %>%
+    filter(ann_label != "")
+
+  ann_k2 <- base_ann %>%
+    select(comparison, y_id, fdr_text) %>%
+    left_join(map_k2, by = c("comparison", "y_id")) %>%
+    filter(!is.na(x)) %>%
+    transmute(comparison, x, y_id, ann_label = fdr_text)
+
+  ann <- bind_rows(ann_k1, ann_k2)
+
+  # if numeric x, bring x_pos into ann for plotting
+  if (use_xpos) {
+    x_map_all <- df0 %>% distinct(x, x_pos)
+    ann <- ann %>% left_join(x_map_all, by = "x")
+  }
+
+  add_p_layer <- function(p, df_section) {
+    if (!annotate_p) return(p)
+
+    ann_section <- ann %>%
+      semi_join(df_section, by = c("x", "y_id")) %>%
+      filter(!startsWith(as.character(y_id), "##"))
+
+    p +
+      shadowtext::geom_shadowtext(
+        data = ann_section,
+        aes(x = if (use_xpos) x_pos else x, y = y_id, label = ann_label),
+        inherit.aes = FALSE,
+        color = "white",
+        bg.colour = "black",
+        bg.r = 0.12,
+        size = p_text_size
+      )
+  }
+
+  # helper: x title per panel
+  x_title_for <- function(panel) if (panel %in% show_x_title_on) x_title else NULL
+
+  # ---- base themes ----
+  base_theme_top <- theme_classic() +
+    theme(
+      axis.title.x = element_text(size = x_title_size),
+      axis.title.y = element_blank(),
+      axis.text.y  = ggtext::element_markdown(size = y_text_size),
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.line.x  = element_blank(),
+
+      legend.key.height = legend_key_height,
+      legend.key.width  = legend_key_width
+    )
+
+  base_theme_bot <- theme_classic() +
+    theme(
+      axis.title.x = element_text(size = x_title_size),
+      axis.title.y = element_blank(),
+      axis.text.x  = element_text(angle = 45, hjust = 1, size = x_text_size),
+      axis.text.y  = ggtext::element_markdown(size = y_text_size),
+
+      legend.key.height = legend_key_height,
+      legend.key.width  = legend_key_width
+    )
+
+  # ---- x scale (discrete vs continuous) ----
+  x_scale_top <- function() {
+    if (use_xpos) {
+      scale_x_continuous(breaks = breaks_vec, labels = labels_vec, expand = c(0, 0))
+    } else {
+      scale_x_discrete(labels = x_labeler, drop = FALSE)
+    }
+  }
+  x_scale_bot <- x_scale_top
+
+  # ---- plots ----
+  # NOTE: when using numeric x, geom_tile width should match the "step_size" used for real columns.
+  # If your step_size is 1, width=1 looks good. If you change step_size, adjust width accordingly.
+  tile_width <- if (use_xpos) 1 else 0.9
+
+  p_cont <- ggplot(df_cont, aes(x = if (use_xpos) x_pos else x, y = y_id, fill = value_plot_cont)) +
+    geom_tile(width = tile_width) +
+    scale_fill_gradientn(colours = RColorBrewer::brewer.pal(9, "Blues"),
+                         na.value = "white",
+                         name = legend_title_cont) +
+    x_scale_top() +
+    scale_y_discrete(labels = cont_pack$y_labeler, drop = FALSE) +
+    labs(title = cont_subtitle, x = x_title_for("cont"), y = NULL) +
+    base_theme_top +
+    theme(
+      plot.title   = element_text(size = cont_subtitle_size),
+      legend.title = element_text(size = legend_title_size_cont),
+      legend.text  = element_text(size = legend_text_size_cont)
+    )
+  p_cont <- add_p_layer(p_cont, df_cont)
+
+  p_bin <- ggplot(df_bin, aes(x = if (use_xpos) x_pos else x, y = y_id, fill = value_plot_bin)) +
+    geom_tile(width = tile_width) +
+    scale_fill_gradientn(colours = RColorBrewer::brewer.pal(9, "YlOrRd"),
+                         limits = c(0, 1),
+                         na.value = "white",
+                         name = legend_title_bin) +
+    x_scale_top() +
+    scale_y_discrete(labels = bin_pack$y_labeler, drop = FALSE) +
+    labs(title = bin_subtitle, x = x_title_for("bin"), y = NULL) +
+    base_theme_top +
+    theme(
+      plot.title   = element_text(size = bin_subtitle_size),
+      legend.title = element_text(size = legend_title_size_bin),
+      legend.text  = element_text(size = legend_text_size_bin)
+    )
+  p_bin <- add_p_layer(p_bin, df_bin)
+
+  # categorical: grey tiles only for non-header rows
+  df_cat_tiles <- df_cat %>% filter(!startsWith(as.character(y_id), "##"))
+
+  p_cat <- ggplot(df_cat_tiles, aes(x = if (use_xpos) x_pos else x, y = y_id)) +
+    geom_tile(fill = categorical_grey, width = tile_width) +
+    x_scale_bot() +
+    scale_y_discrete(labels = cat_pack$y_labeler, drop = FALSE) +
+    labs(title = cat_subtitle, x = x_title_for("cat"), y = NULL) +
+    base_theme_bot +
+    theme(
+      plot.title = element_text(size = cat_subtitle_size)
+    )
+  p_cat <- add_p_layer(p_cat, df_cat_tiles)
+
+  (p_cont / p_bin / p_cat) +
+    patchwork::plot_layout(heights = c(n_cont, n_bin, n_cat)) +
+    patchwork::plot_annotation(
+      title = title,
+      theme = theme(plot.title = element_text(size = overall_title_size))
+    )
+}
+```
+
+
+
+```{r}
+map <- plot_mixed_heatmap_split(
+  heat_df_spaced,
+  dictionary_DIR = dictionary_DIR_diff,
+  title = "My heatmap ordered by modality",
+  overall_title_size = 20,
+
+  # p-value annotation text
+  p_text_size = 4,
+
+  # axis text sizes
+  x_text_size = 11,
+  y_text_size = 11,
+
+  # y-axis header/variable styling
+  header_text_size = 13,
+  var_text_size = 11,
+
+  # subplot “subtitles” (panel titles) + sizes
+  cont_subtitle = "Continuous (means)",
+  bin_subtitle  = "Binary (proportions)",
+  cat_subtitle  = "Categorical",
+  cont_subtitle_size = 16,
+  bin_subtitle_size  = 16,
+  cat_subtitle_size  = 16,
+
+  # x-axis title text + size
+  x_title = "Modality | group",
+  x_title_size = 14,
+  show_x_title_on = c("cat"),
+
+  # legend sizing (per panel)
+  legend_title_size_cont = 12,
+  legend_text_size_cont  = 11,
+  legend_title_size_bin  = 12,
+  legend_text_size_bin   = 11
+)
+
+export_heatmap(map, heat_df_spaced, file = "heatmap_group_means_ordered.svg",
+               dpi = 300, height = 18, width = 14)
+
+map
+
+```
+
+
+# Site and recruitment source
+```{r}
+# Packages
+library(dplyr)
+library(ggplot2)
+
+# Ensure factors (optional but recommended)
+merged_data <- merged_data %>%
+  mutate(
+    sites = as.factor(Site),
+    chrrecruit = as.factor(chrrecruit)
+  )
+
+# Contingency table
+tab <- table(merged_data$sites, merged_data$chrrecruit)
+tab
+
+# Chi-square test (overall association)
+chi <- chisq.test(tab)
+chi
+
+# If expected counts are small, the chi-square approximation can be shaky:
+chi$expected
+
+# Option A: Monte Carlo p-value (good practical fallback)
+chisq.test(tab, simulate.p.value = TRUE, B = 20000)
+
+# Option B: Fisher's exact test (can be slow/too large for big tables)
+# fisher.test(tab)
+```
+
+```{r}
+site_recruit_dist <- ggplot(merged_data, aes(x = sites, fill = chrrecruit)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Site",
+    y = "Proportion within site",
+    fill = "Recruitment method",
+    title = "Recruitment method distribution by site"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+    filename = 'site_recruitment_dist.pdf',
+    plot = site_recruit_dist,
+    width = 20,
+    height = 20,
+    dpi = 300,
+    limitsize = FALSE
+  )
+```
+
+```{r}
+plot_df <- merged_data %>%
+  count(sites, chrrecruit, name = "n") %>%
+  group_by(sites) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+site_recruit_plot <- ggplot(plot_df, aes(x = chrrecruit, y = sites, fill = prop)) +
+  geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent_format()) +
+  labs(
+    x = "Recruitment method",
+    y = "Site",
+    fill = "Within-site %",
+    title = "Within-site recruitment proportions"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+    filename = 'site_recruitment.pdf',
+    plot = site_recruit_plot,
+    width = 20,
+    height = 20,
+    dpi = 300,
+    limitsize = FALSE
+  )
+```
+
+```{r}
+library(tidyr)
+library(seriation)
+
+wide <- plot_df %>%
+  select(sites, chrrecruit, prop) %>%
+  pivot_wider(names_from = chrrecruit, values_from = prop, values_fill = 0)
+
+mat <- as.matrix(wide[,-1])
+rownames(mat) <- wide$sites
+
+row_ord <- get_order(seriate(dist(mat), method = "OLO"))
+col_ord <- get_order(seriate(dist(t(mat)), method = "OLO"))
+
+plot_df2 <- plot_df %>%
+  mutate(
+    sites = factor(sites, levels = rownames(mat)[row_ord]),
+    chrrecruit = factor(chrrecruit, levels = colnames(mat)[col_ord])
+  )
+
+site_recruit_plot2 <- ggplot(plot_df2, aes(chrrecruit, sites, fill = prop)) +
+  geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent_format()) +
+  labs(x = "Recruitment method", y = "Site", fill = "Within-site %") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+    filename = 'site_recruitment2.pdf',
+    plot = site_recruit_plot2,
+    width = 20,
+    height = 20,
+    dpi = 300,
+    limitsize = FALSE
+  )
+
+site_recruit_plot2
+```
+
+# Site differences 
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(stringr)
+
+subgroup_vars <- c("Psychoticism", "Detachment", "Internalising",
+                   "Functioning", "Cognition", "final")
+
+# Long format: one row per person x subgroup type
+long_df <- Labels_data_disc %>%
+  select(Site, all_of(subgroup_vars)) %>%
+  mutate(
+    Site = as.factor(Site),
+    across(all_of(subgroup_vars), as.character)   # <- key line
+  ) %>%
+  pivot_longer(
+    cols = all_of(subgroup_vars),
+    names_to = "subgroup_type",
+    values_to = "subgroup_label"
+  ) %>%
+  mutate(
+    subgroup_type  = factor(subgroup_type, levels = subgroup_vars),
+    subgroup_label = factor(subgroup_label)
+  ) %>%
+  filter(!is.na(Site), !is.na(subgroup_label))
+
+# Helper: chi-square with Monte Carlo p-value + Cramer's V
+one_test <- function(df) {
+  tab <- table(df$Site, df$subgroup_label)
+
+  # Chi-square with simulated p-value (robust when expected counts are small)
+  chi <- suppressWarnings(chisq.test(tab, simulate.p.value = TRUE, B = 20000))
+
+  # Cramer's V
+  n <- sum(tab)
+  r <- nrow(tab); c <- ncol(tab)
+  V <- sqrt(unname(chi$statistic) / (n * (min(r - 1, c - 1))))
+
+  tibble(
+    statistic = unname(chi$statistic),
+    df = unname(chi$parameter),
+    p_value = unname(chi$p.value),
+    cramers_v = V,
+    n = n,
+    n_sites = r,
+    n_labels = c
+  )
+}
+
+test_results <- long_df %>%
+  group_by(subgroup_type) %>%
+  group_modify(~ one_test(.x)) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  arrange(p_adj)
+
+test_results
+```
+
+```{r}
+library(ggplot2)
+library(forcats)
+library(scales)
+
+plot_df <- long_df %>%
+  count(subgroup_type, Site, subgroup_label, name = "n") %>%
+  group_by(subgroup_type, Site) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+ggplot(plot_df, aes(x = Site, y = prop, fill = subgroup_label)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  facet_wrap(~ subgroup_type, ncol = 2) +
+  labs(
+    x = "Site",
+    y = "Proportion within site",
+    fill = "Subgroup label",
+    title = "Subgroup label distribution by site (six subgroup definitions)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(tibble)
+
+subgroup_vars <- c("Psychoticism", "Detachment", "Internalising",
+                   "Functioning", "Cognition", "final")
+
+long_df <- Labels_data_disc %>%
+  select(Site, all_of(subgroup_vars)) %>%
+  mutate(
+    Site = as.factor(Site),
+    across(all_of(subgroup_vars), as.character)
+  ) %>%
+  pivot_longer(all_of(subgroup_vars),
+               names_to = "subgroup_type",
+               values_to = "subgroup_label") %>%
+  filter(!is.na(Site), !is.na(subgroup_label)) %>%
+  mutate(
+    subgroup_type = factor(subgroup_type, levels = subgroup_vars),
+    subgroup_label = as.factor(subgroup_label)
+  )
+
+one_test <- function(df) {
+  # drop unused levels inside this subgroup
+  df <- df %>%
+    mutate(
+      Site = droplevels(Site),
+      subgroup_label = droplevels(subgroup_label)
+    )
+
+  tab <- table(df$Site, df$subgroup_label)
+
+  # remove any all-zero rows/cols (extra safety)
+  tab <- tab[rowSums(tab) > 0, colSums(tab) > 0, drop = FALSE]
+
+  # if degenerate after cleanup, return NA
+  if (nrow(tab) < 2 || ncol(tab) < 2) {
+    return(tibble(
+      statistic = NA_real_, df = NA_integer_, p_value = NA_real_,
+      cramers_v = NA_real_, n = sum(tab),
+      n_sites = nrow(tab), n_labels = ncol(tab)
+    ))
+  }
+
+  chi <- suppressWarnings(chisq.test(tab, simulate.p.value = TRUE, B = 20000))
+
+  n <- sum(tab)
+  r <- nrow(tab); c <- ncol(tab)
+  V <- sqrt(unname(chi$statistic) / (n * (min(r - 1, c - 1))))
+
+  tibble(
+    statistic = unname(chi$statistic),
+    df = unname(chi$parameter),
+    p_value = unname(chi$p.value),
+    cramers_v = V,
+    n = n,
+    n_sites = r,
+    n_labels = c
+  )
+}
+
+test_results <- long_df %>%
+  group_by(subgroup_type) %>%
+  group_modify(~ one_test(.x)) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  arrange(p_adj)
+
+test_results
+```
+```{r}
+site_subgroups <- ggplot(plot_df, aes(x = subgroup_label, y = Site, fill = prop)) +
+  geom_tile() +
+  facet_wrap(~ subgroup_type, scales = "free_x") +
+  scale_fill_viridis_c(labels = percent_format()) +
+  labs(
+    x = "Subgroup label",
+    y = "Site",
+    fill = "Within-site %",
+    title = "Heatmap of subgroup label proportions within site"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+    filename = 'site_subgroup.pdf',
+    plot = site_subgroups,
+    width = 20,
+    height = 20,
+    dpi = 300,
+    limitsize = FALSE
+  )
+
+site_subgroups
+```
+
+```{r}
+facet_labs <- test_results %>%
+  mutate(
+    facet = paste0(
+      subgroup_type,
+      "\nBH p=", format.pval(p_adj, digits = 2, eps = 1e-4),
+      " | V=", round(cramers_v, 2)
+    )
+  ) %>%
+  select(subgroup_type, facet)
+
+plot_df2 <- plot_df %>%
+  left_join(facet_labs, by = "subgroup_type")
+
+site_subgroups2 <- ggplot(plot_df2, aes(x = Site, y = prop, fill = subgroup_label)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  facet_wrap(~ facet, ncol = 2) +
+  labs(
+    x = "Site",
+    y = "Proportion within site",
+    fill = "Subgroup label",
+    title = "Subgroup-by-site differences with BH-adjusted p-values and effect sizes"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+    filename = 'site_subgroup2.pdf',
+    plot = site_subgroups2,
+    width = 20,
+    height = 20,
+    dpi = 300,
+    limitsize = FALSE
+  )
+
+site_subgroups2
+```
+
+# Recruitment differences
+```{r}
+library(dplyr)
+library(tidyr)
+
+subgroup_vars <- c("Psychoticism", "Detachment", "Internalising",
+                   "Functioning", "Cognition", "final")
+
+df_long <- Labels_data_disc %>%
+  select(Site, chrrecruit, all_of(subgroup_vars)) %>%
+  mutate(
+    Site = as.factor(Site),
+    chrrecruit = as.factor(chrrecruit),
+    across(all_of(subgroup_vars), as.character)   # avoid type-mix in pivot
+  ) %>%
+  pivot_longer(
+    cols = all_of(subgroup_vars),
+    names_to = "subgroup_type",
+    values_to = "subgroup_label"
+  ) %>%
+  filter(!is.na(Site), !is.na(chrrecruit), !is.na(subgroup_label)) %>%
+  mutate(
+    subgroup_type  = factor(subgroup_type, levels = subgroup_vars),
+    subgroup_label = factor(subgroup_label)
+  )
+```
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(tibble)
+
+subgroup_vars <- c("Psychoticism", "Detachment", "Internalising",
+                   "Functioning", "Cognition", "final")
+
+long_df_recruit <- Labels_data_disc %>%
+  select(chrrecruit, all_of(subgroup_vars)) %>%
+  mutate(
+    chrrecruit = as.factor(chrrecruit),
+    across(all_of(subgroup_vars), as.character)
+  ) %>%
+  pivot_longer(all_of(subgroup_vars),
+               names_to = "subgroup_type",
+               values_to = "subgroup_label") %>%
+  filter(!is.na(chrrecruit), !is.na(subgroup_label)) %>%
+  mutate(
+    subgroup_type = factor(subgroup_type, levels = subgroup_vars),
+    subgroup_label = as.factor(subgroup_label)
+  )
+
+one_test <- function(df) {
+  # drop unused levels inside this subgroup
+  df <- df %>%
+    mutate(
+      chrrecruit = droplevels(chrrecruit),
+      subgroup_label = droplevels(subgroup_label)
+    )
+
+  tab <- table(df$chrrecruit, df$subgroup_label)
+
+  # remove any all-zero rows/cols (extra safety)
+  tab <- tab[rowSums(tab) > 0, colSums(tab) > 0, drop = FALSE]
+
+  # if degenerate after cleanup, return NA
+  if (nrow(tab) < 2 || ncol(tab) < 2) {
+    return(tibble(
+      statistic = NA_real_, df = NA_integer_, p_value = NA_real_,
+      cramers_v = NA_real_, n = sum(tab),
+      n_sites = nrow(tab), n_labels = ncol(tab)
+    ))
+  }
+
+  chi <- suppressWarnings(chisq.test(tab, simulate.p.value = TRUE, B = 20000))
+
+  n <- sum(tab)
+  r <- nrow(tab); c <- ncol(tab)
+  V <- sqrt(unname(chi$statistic) / (n * (min(r - 1, c - 1))))
+
+  tibble(
+    statistic = unname(chi$statistic),
+    df = unname(chi$parameter),
+    p_value = unname(chi$p.value),
+    cramers_v = V,
+    n = n,
+    n_sites = r,
+    n_labels = c
+  )
+}
+
+test_results_recruit <- long_df_recruit %>%
+  group_by(subgroup_type) %>%
+  group_modify(~ one_test(.x)) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  arrange(p_adj)
+
+test_results_recruit
+```
+
+```{r}
+plot_df_recruit <- long_df_recruit %>%
+  count(subgroup_type, chrrecruit, subgroup_label, name = "n") %>%
+  group_by(subgroup_type, chrrecruit) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+ggplot(plot_df_recruit, aes(x = chrrecruit, y = prop, fill = subgroup_label)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  facet_wrap(~ subgroup_type, ncol = 2) +
+  labs(
+    x = "Recruitment source",
+    y = "Proportion within recruitment source",
+    fill = "Subgroup label",
+    title = "Subgroup label distribution by recruitment (six subgroup definitions)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+```{r}
+recruitment_subgroups <- ggplot(plot_df_recruit, aes(x = subgroup_label, y = chrrecruit, fill = prop)) +
+  geom_tile() +
+  facet_wrap(~ subgroup_type, scales = "free_x") +
+  scale_fill_viridis_c(labels = percent_format()) +
+  labs(
+    x = "Subgroup label",
+    y = "Recruitment source",
+    fill = "Within-recruitment %",
+    title = "Heatmap of subgroup label proportions within recruitment source"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+ggsave(
+    filename = 'recruitment_subgroup.pdf',
+    plot = recruitment_subgroups,
+    width = 20,
+    height = 20,
+    dpi = 300,
+    limitsize = FALSE
+  )
+
+recruitment_subgroups
+```
+
+```{r}
+facet_labs <- test_results_recruit %>%
+  mutate(
+    facet = paste0(
+      subgroup_type,
+      "\nBH p=", format.pval(p_adj, digits = 2, eps = 1e-4),
+      " | V=", round(cramers_v, 2)
+    )
+  ) %>%
+  select(subgroup_type, facet)
+
+plot_df2 <- plot_df_recruit %>%
+  left_join(facet_labs, by = "subgroup_type")
+
+recruitment_subgroups2 <- ggplot(plot_df2, aes(x = chrrecruit, y = prop, fill = subgroup_label)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  facet_wrap(~ facet, ncol = 2) +
+  labs(
+    x = "Recruitment source",
+    y = "Proportion within recruitment",
+    fill = "Subgroup label",
+    title = "Subgroup-by-recruitment differences with BH-adjusted p-values and effect sizes"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+    filename = 'recruitment_subgroup2.pdf',
+    plot = recruitment_subgroups2,
+    width = 20,
+    height = 20,
+    dpi = 300,
+    limitsize = FALSE
+  )
+
+recruitment_subgroups2
+```
+
+# Site+recruitment differences subgroups
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(nnet)      # multinom
+library(broom)
+
+subgroup_vars <- c("Psychoticism","Detachment","Internalising","Functioning","Cognition","final")
+
+df_long <- Labels_data_disc %>%
+  select(Site, chrrecruit, all_of(subgroup_vars)) %>%
+  mutate(
+    Site = factor(Site),
+    chrrecruit = factor(chrrecruit),
+    across(all_of(subgroup_vars), as.character)
+  ) %>%
+  pivot_longer(all_of(subgroup_vars), names_to="subgroup_type", values_to="subgroup_label") %>%
+  filter(!is.na(Site), !is.na(chrrecruit), !is.na(subgroup_label)) %>%
+  mutate(
+    subgroup_type = factor(subgroup_type, levels = subgroup_vars),
+    subgroup_label = factor(subgroup_label)
+  )
+
+fit_one_type <- function(d){
+  d <- d %>%
+    mutate(
+      Site = droplevels(Site),
+      chrrecruit = droplevels(chrrecruit),
+      subgroup_label = droplevels(subgroup_label)
+    )
+
+  if (nlevels(d$subgroup_label) < 2) return(NULL)
+
+  # Models
+  m0      <- multinom(subgroup_label ~ 1,         data = d, trace = FALSE)
+  m_site  <- multinom(subgroup_label ~ Site,      data = d, trace = FALSE)
+  m_recr  <- multinom(subgroup_label ~ chrrecruit,data = d, trace = FALSE)
+  m_full  <- multinom(subgroup_label ~ Site + chrrecruit, data = d, trace = FALSE)
+
+  # Unadjusted effects (vs intercept-only)
+  site_unadj   <- anova(m0, m_site, test = "Chisq")
+  recr_unadj   <- anova(m0, m_recr, test = "Chisq")
+
+  # Adjusted effects (incremental)
+  # Recruitment adjusted for Site: (Site) -> (Site + Recruit)
+  recr_adj_site <- anova(m_site, m_full, test = "Chisq")
+
+  # Site adjusted for Recruitment: (Recruit) -> (Site + Recruit)
+  site_adj_recr <- anova(m_recr, m_full, test = "Chisq")
+
+  tibble(
+    lr_site_unadjusted = site_unadj$`LR stat.`[2],
+    p_site_unadjusted  = site_unadj$`Pr(Chi)`[2],
+
+    lr_recruit_unadjusted = recr_unadj$`LR stat.`[2],
+    p_recruit_unadjusted  = recr_unadj$`Pr(Chi)`[2],
+
+    lr_recruit_adj_for_site = recr_adj_site$`LR stat.`[2],
+    p_recruit_adj_for_site  = recr_adj_site$`Pr(Chi)`[2],
+
+    lr_site_adj_for_recruit = site_adj_recr$`LR stat.`[2],
+    p_site_adj_for_recruit  = site_adj_recr$`Pr(Chi)`[2]
+  )
+}
+
+model_results <- df_long %>%
+  group_by(subgroup_type) %>%
+  group_modify(~{
+    out <- fit_one_type(.x)
+    if (is.null(out)) tibble(
+      lr_site_unadjusted = NA_real_, p_site_unadjusted = NA_real_,
+      lr_recruit_unadjusted = NA_real_, p_recruit_unadjusted = NA_real_,
+      lr_recruit_adj_for_site = NA_real_, p_recruit_adj_for_site = NA_real_,
+      lr_site_adj_for_recruit = NA_real_, p_site_adj_for_recruit = NA_real_
+    ) else out
+  }) %>%
+  ungroup() %>%
+  mutate(
+    # BH-adjust each “question family” across the 6 subgroup schemes
+    p_site_unadjusted_BH        = p.adjust(p_site_unadjusted, method = "BH"),
+    p_recruit_unadjusted_BH     = p.adjust(p_recruit_unadjusted, method = "BH"),
+    p_recruit_adj_for_site_BH   = p.adjust(p_recruit_adj_for_site, method = "BH"),
+    p_site_adj_for_recruit_BH   = p.adjust(p_site_adj_for_recruit, method = "BH")
+  ) %>%
+  rename(subgroup_scheme = subgroup_type)
+
+model_results
+
+```
+
+```{r}
+library(marginaleffects)
+library(dplyr)
+
+plot_one_type <- function(d, type_name){
+  d <- d %>%
+    mutate(Site = droplevels(Site),
+           chrrecruit = droplevels(chrrecruit),
+           subgroup_label = droplevels(subgroup_label))
+
+  m_site <- nnet::multinom(subgroup_label ~ Site, data=d, trace=FALSE)
+  m_full <- nnet::multinom(subgroup_label ~ Site + chrrecruit, data=d, trace=FALSE)
+
+  p1 <- predictions(m_site, newdata = datagrid(Site = levels(d$Site))) %>%
+    rename(outcome_level = group) %>%  # <- outcome category column
+    mutate(model = "Unadjusted (Site only)")
+
+  p2 <- avg_predictions(m_full, variables = "Site") %>%
+    rename(outcome_level = group) %>%
+    mutate(model = "Adjusted (Site + recruitment)")
+
+  bind_rows(p1, p2) %>%
+    mutate(subgroup_type = type_name)
+}
+
+pred_df <- df_long %>%
+  group_split(subgroup_type) %>%
+  purrr::map_dfr(~ plot_one_type(.x, unique(.x$subgroup_type))) %>%
+  filter(!is.na(outcome_level), outcome_level != "NA") %>%
+  mutate(outcome_level = factor(outcome_level))
+
+ggplot(pred_df, aes(x = Site, y = estimate, color = model)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0, position = position_dodge(width = 0.5)) +
+  facet_grid(subgroup_type ~ outcome_level, scales = "free_y") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+plot_df <- df_long %>%
+  count(subgroup_type, chrrecruit, Site, subgroup_label, name="n") %>%
+  group_by(subgroup_type, chrrecruit, Site) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+site_recruitment_subgroups <- ggplot(plot_df, aes(x = Site, y = prop, fill = subgroup_label)) +
+  geom_col(position="fill") +
+  facet_grid(subgroup_type ~ chrrecruit, scales = "free_x") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x="Site", y="Proportion within site", fill="Subgroup label") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+ggsave(
+    filename = 'site_recruitment_subgroup.pdf',
+    plot = site_recruitment_subgroups,
+    width = 20,
+    height = 20,
+    dpi = 300,
+    limitsize = FALSE
+  )
+
+site_recruitment_subgroups
+```
+```{r}
+one_chi <- function(d){
+  d <- d %>% mutate(Site = droplevels(Site), subgroup_label = droplevels(subgroup_label))
+  tab <- table(d$Site, d$subgroup_label)
+  tab <- tab[rowSums(tab)>0, colSums(tab)>0, drop=FALSE]
+  if (nrow(tab) < 2 || ncol(tab) < 2) return(tibble(p_value=NA))
+  chi <- suppressWarnings(chisq.test(tab, simulate.p.value=TRUE, B=20000))
+  tibble(p_value = unname(chi$p.value))
+}
+
+strat_tests <- df_long %>%
+  group_by(subgroup_type, chrrecruit) %>%
+  group_modify(~ one_chi(.x)) %>%
+  ungroup() %>%
+  group_by(subgroup_type) %>%
+  mutate(p_adj = p.adjust(p_value, method="BH")) %>%
+  ungroup()
+
+strat_tests
+```
+
+
+## Test sample
+
+```{r}
+# Set path to dictionary
+dictionary_DIR_diff <- "/Users/jentemeijer/Library/CloudStorage/OneDrive-Personal/OneDrive/PhD/Feature selection/Complete_dictionary_differences.xlsx"
+
+comparisons <- c(
+  "Psychoticism",
+  "Detachment",
+  "Internalising",
+  "Functioning",
+  "Cognition",
+  "final"
+)
+
+tables_test <- setNames(
+  lapply(comparisons, function(comp) {
+    demographic_table(Labels_data_test, dictionary_DIR_diff, comparison = comp, , modality_order=modality_order)
+  }),
+  comparisons
+)
+
+# Put them all into one Word document
+
+doc_test <- read_docx()
+
+for (comp in names(tables_test)) {
+  doc_test <- doc_test %>%
+    body_add_par(paste0("Demographics by ", comp), style = "heading 1") %>%
+    body_add_flextable(tables_test[[comp]]) %>%
+    body_add_par("", style = "Normal")
+}
+
+print(doc_test, target = "demographics_all_comparisons_testsample.docx")
+
+```
+
+```{r}
+comparisons <- c("Psychoticism", "Detachment", "Internalising",
+                 "Functioning", "Cognition", "final")
+
+out_test <- summarize_differences(
+  Labels_data_test, dictionary_DIR_diff,
+  comparisons = comparisons,
+  fdr_alpha = 0.05,
+  keep = "all"   # "sig" = only FDR < alpha; "all" = everything
+)
+
+# View
+out_test$compact
+
+# Export to Word
+export_compact_to_word(out_test$compact, file = "differences_summary_testsample.docx")
+```
+

@@ -18,6 +18,18 @@ BASE_DIR=${BASE_DIR:-$(pwd)}
 export BASE_DIR
 mkdir -p "${BASE_DIR}/logs"
 
+SIF=${SIF:-multiview_env.sif}
+if [ ! -f "${SIF}" ] && [ -f "${BASE_DIR}/${SIF}" ]; then
+  SIF="${BASE_DIR}/${SIF}"
+fi
+if [ ! -f "${SIF}" ]; then
+  echo "ERROR: Apptainer image not found: ${SIF}" >&2
+  echo "Set SIF to a valid .sif path or place multiview_env.sif in ${BASE_DIR}" >&2
+  exit 2
+fi
+export SIF
+echo "Using Apptainer image: ${SIF}"
+
 GA_ROOT=${GA_ROOT:-"${BASE_DIR}/intermediates/fold${FOLD_INDEX}/ga"}
 BOOT_DIR=${GA_ROOT}/gen${GEN}
 
@@ -28,7 +40,7 @@ POP_INIT=${POP_INIT:-"${GA_ROOT}/population_init_fold${FOLD_INDEX}.pkl"}
 # Use all allocated CPUs for parallelisation
 N_JOBS=${SLURM_CPUS_PER_TASK:-1}
 
-apptainer exec ${SIF} \
+apptainer exec "${SIF}" \
   python -u full_pipeline.py \
     --mode gather \
     --input_csv          "${INPUT_CSV}" \

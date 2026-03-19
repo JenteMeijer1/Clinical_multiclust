@@ -18,6 +18,18 @@ BASE_DIR=${BASE_DIR:-$(pwd)}
 export BASE_DIR
 mkdir -p "${BASE_DIR}/logs"
 
+SIF=${SIF:-multiview_env.sif}
+if [ ! -f "${SIF}" ] && [ -f "${BASE_DIR}/${SIF}" ]; then
+  SIF="${BASE_DIR}/${SIF}"
+fi
+if [ ! -f "${SIF}" ]; then
+  echo "ERROR: Apptainer image not found: ${SIF}" >&2
+  echo "Set SIF to a valid .sif path or place multiview_env.sif in ${BASE_DIR}" >&2
+  exit 2
+fi
+export SIF
+echo "Using Apptainer image: ${SIF}"
+
 echo ">>> bootstrap_generation.sh: SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}  FOLD_INDEX=${FOLD_INDEX:-<unset>}  GEN=${GEN:-<unset>}"
 
 BIDX=${SLURM_ARRAY_TASK_ID}
@@ -44,7 +56,7 @@ EXIT_CODE=1
 while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ $EXIT_CODE -ne 0 ]; do
   ((RETRY_COUNT++))
   echo "=== [Fold ${FOLD_INDEX}] Bootstrap ${BIDX} attempt $RETRY_COUNT at $(date -Is) ==="
-  apptainer exec ${SIF} \
+  apptainer exec "${SIF}" \
     python -u full_pipeline.py \
       --mode bootstrap \
       --input_csv "${INPUT_CSV}" \

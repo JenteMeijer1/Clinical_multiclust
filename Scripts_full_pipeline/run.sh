@@ -32,6 +32,15 @@ fi
 
 # Apptainer image with all dependencies
 export SIF=multiview_env.sif 
+if [ ! -f "${SIF}" ] && [ -f "${BASE_DIR}/${SIF}" ]; then
+  export SIF="${BASE_DIR}/${SIF}"
+fi
+if [ ! -f "${SIF}" ]; then
+  echo "ERROR: Apptainer image not found: ${SIF}" >&2
+  echo "Place multiview_env.sif in ${BASE_DIR} or set SIF to a valid path." >&2
+  exit 2
+fi
+echo "Using Apptainer image: ${SIF}"
 # Import data
 #export INPUT_CSV="synthetic_multimodal_spartan.csv" #For synthetic data in testing
 export INPUT_CSV="cleaned_discovery_data.csv" #actual data
@@ -94,14 +103,14 @@ export MAX_CONCURRENT=200
 # Whether to run SVM classification on the final clustering labels in OUTER mode (TRUE/FALSE)
 export DO_SVM="TRUE" 
 # Whether to enforce a minimum cluster size of 10 in the final clustering step.
-export MINCLUSTER="FALSE" 
+export MINCLUSTER="TRUE" 
 # Minimum cluster size when enforcing minimum cluster size
-export MINCLUSTER_N=1
+export MINCLUSTER_N=50
 # Objectives optimised by the GA (order matters). Allowed tokens defined in full_pipeline.py. An example of different options are: min or mean. Example: "avg_view_stability avg_view_quality final_stability final_quality" 
 # For the stability measures you need to add which stability metric you want to use. So after stability, you can add: _jaccard, _coassoc, _ccc or _ari
 export GA_OBJECTIVES="mean_view_stability_ari mean_view_quality final_stability_ari final_quality"
 # Fusion methods allowed during GA search / mutation. Current options: agreement, disagreement, consensus (which is a strict consensus)
-export FUSION_METHODS="consensus"
+export FUSION_METHODS="agreement"
 # Set to "TRUE" for testing mode (tests against true labels); "FALSE" for full run
 export TEST="FALSE" 
 #Crossover rate in GA
@@ -112,6 +121,21 @@ export GA_MUTPB=0.3
 export GA_ELITISM=2 
 # Wether to run the final merge or not 
 export RUN_MERGE="TRUE"
+# Compute permutation-based p-values for modality and integrated cluster solutions in merge mode
+export COMPUTE_CLUSTER_PVALUES="TRUE"
+# Permutation mode for p-values: "fast" keeps labels fixed, "full" reclusters each permutation
+export CLUSTER_PVALUE_MODE="fast"
+# Statistic used in permutation test: "composite" or "silhouette"
+export CLUSTER_PVALUE_STAT="composite"
+# Number of permutations for p-value estimation
+export CLUSTER_PVALUE_PERMUTATIONS=1000
+# Optional: separate permutation counts (defaults to CLUSTER_PVALUE_PERMUTATIONS when unset)
+export CLUSTER_PVALUE_PERMUTATIONS_QUALITY=1000
+export CLUSTER_PVALUE_PERMUTATIONS_ARI=500
+# Parallel workers for permutation test (0 uses --n_jobs from merge script)
+export CLUSTER_PVALUE_JOBS=0
+# Base RNG seed for permutation test
+export CLUSTER_PVALUE_SEED=314159
 
 TEST_phase=0 # Set to 0 for full run or no testing
 
@@ -324,13 +348,14 @@ if [ "${RUN_MERGE}" == "FALSE" ]; then
 elif [ "${RUN_MERGE}" == "TRUE" ]; then
   echo "Scheduling final merge and SVM classification job..."
   sbatch ${PARTITION_OPT} --dependency=afterok:${dep_string} \
-    --export=ALL,DO_SVM,N_BOOTSTRAP,MINCLUSTER \
+    --export=ALL,DO_SVM,N_BOOTSTRAP,MINCLUSTER,COMPUTE_CLUSTER_PVALUES,CLUSTER_PVALUE_MODE,CLUSTER_PVALUE_STAT,CLUSTER_PVALUE_PERMUTATIONS,CLUSTER_PVALUE_PERMUTATIONS_QUALITY,CLUSTER_PVALUE_PERMUTATIONS_ARI,CLUSTER_PVALUE_JOBS,CLUSTER_PVALUE_SEED \
     final_merge.sh
   exit 0
 fi
 
 
 #sbatch --export=ALL,DO_SVM,N_BOOTSTRAP,MINCLUSTER final_merge.sh
+#sbatch -p intelsr_short --export=ALL,DO_SVM,N_BOOTSTRAP,MINCLUSTER final_merge.sh
 
 
 

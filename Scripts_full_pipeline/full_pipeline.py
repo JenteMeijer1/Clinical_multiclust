@@ -274,7 +274,8 @@ def preprocessing(df,
                   skew_threshold=0.75,
                   scaler_type='robust',
                   modalities=['Internalising', 'Functioning', 'Cognition', 'Detachment', 'Psychoticism'],
-                  impute_parea=False):
+                  impute_parea=False,
+                  export_preprocessing_details=False):
    """
     Preprocess the data by removing high missing data, applying power transformation, dummy coding, scaling, and imputing.
     
@@ -292,12 +293,30 @@ def preprocessing(df,
     """
    
    
-   df_transformed = auto_power_transform(df, skew_threshold = skew_threshold) # Apply power transformation when data is skewed. 
+   if export_preprocessing_details:
+       df_transformed, power_transform_details = auto_power_transform(
+           df,
+           skew_threshold=skew_threshold,
+           return_details=True
+       ) # Apply power transformation when data is skewed.
+   else:
+       df_transformed = auto_power_transform(df, skew_threshold = skew_threshold) # Apply power transformation when data is skewed.
+       power_transform_details = None
 
 
    df_dummy = dummy_code(df_transformed)
+   dummy_feature_columns = [c for c in df_dummy.columns if c != subject_id_column]
 
-   df_scaled = scale_diverse_data(df_dummy, subject_id_column=subject_id_column, scaler_type = scaler_type) # Scale data with robust scaler
+   if export_preprocessing_details:
+       df_scaled, initial_scaling_details = scale_diverse_data(
+           df_dummy,
+           subject_id_column=subject_id_column,
+           scaler_type=scaler_type,
+           return_details=True
+       )
+   else:
+       df_scaled = scale_diverse_data(df_dummy, subject_id_column=subject_id_column, scaler_type=scaler_type)
+       initial_scaling_details = None
    modal_dict = extract_modalities(meta, df_scaled) # Split data into modalities based on meta
    modal_dict_clean = {modality: modal_dict[modality] for modality in modalities if modality in modal_dict}
 
@@ -305,9 +324,9 @@ def preprocessing(df,
    for mod in modal_dict_clean:
        modal_dict_clean[mod][subject_id_column] = df_scaled[subject_id_column].loc[modal_dict_clean[mod].index]
    
+   subjects_to_drop = set()
    if impute_parea is False:
         # Identify any subjects who are entirely missing in any modality, then drop them from all modalities
-        subjects_to_drop = set()
         for modality, df_mod in modal_dict_clean.items():
             # Exclude subject ID column when checking
             data_only = df_mod.drop(columns=[subject_id_column]) if subject_id_column in df_mod.columns else df_mod
@@ -329,8 +348,27 @@ def preprocessing(df,
                     .reset_index(drop=True)
                 )
 
-   dict_imputed = impute_data(modal_dict_clean, subject_id_column=subject_id_column) # Impute missing data in each modality using KNN imputation
-   dict_final = scale_data(dict_imputed, subject_id_column=subject_id_column, scaler_type=scaler_type) # Scale data in each modality with robust scaler
+   imputation_reference_modalities = {
+       mod: modal_dict_clean[mod].copy()
+       for mod in modal_dict_clean
+   } if export_preprocessing_details else None
+
+   imputation_n_neighbors = 7
+   dict_imputed = impute_data(
+       modal_dict_clean,
+       subject_id_column=subject_id_column,
+       n_neighbors=imputation_n_neighbors
+   ) # Impute missing data in each modality using KNN imputation
+   if export_preprocessing_details:
+       dict_final, final_scaling_details = scale_data(
+           dict_imputed,
+           subject_id_column=subject_id_column,
+           scaler_type=scaler_type,
+           return_details=True
+       )
+   else:
+       dict_final = scale_data(dict_imputed, subject_id_column=subject_id_column, scaler_type=scaler_type)
+       final_scaling_details = None
    
    # --- Canonical reindex across modalities ---
    id_col = subject_id_column
@@ -365,7 +403,33 @@ def preprocessing(df,
        else:
            subject_id_list.append([])
    ae_data = convert_data_for_vae(dict_final, subject_id_column=subject_id_column)
-
+   if export_preprocessing_details:
+       preprocessing_details = {
+           'subject_id_column': subject_id_column,
+           'preprocessing_parameters': {
+               'col_threshold': col_threshold,
+               'row_threshold': row_threshold,
+               'skew_threshold': skew_threshold,
+               'scaler_type': scaler_type,
+               'modalities_requested': list(modalities),
+               'impute_parea': bool(impute_parea)
+           },
+           'subjects_dropped_full_missing_modality': sorted(list(subjects_to_drop)),
+           'power_transform': power_transform_details,
+           'dummy_feature_columns': dummy_feature_columns,
+           'initial_scaling': initial_scaling_details,
+           'imputation_n_neighbors': int(imputation_n_neighbors),
+           'imputation_reference_modalities': imputation_reference_modalities,
+           'final_modality_scaling': final_scaling_details,
+           'modalities_in_output': list(dict_final.keys()),
+           'n_subjects_after_alignment': len(canonical),
+           'canonical_subject_ids': list(canonical),
+           'feature_columns_per_modality': {
+               mod: [c for c in dict_final[mod].columns if c != subject_id_column]
+               for mod in dict_final
+           }
+       }
+       return ae_data, subject_id_list, dict_final, preprocessing_details
    return ae_data, subject_id_list, dict_final
 
 
@@ -838,6 +902,51 @@ def _partition_jaccard_from_labels(labels1, labels2):
     inter = np.logical_and(a, b).sum()
     union = np.logical_or(a, b).sum()
     return float(inter / union) if union > 0 else 0.0
+
+
+def _distribution_summary(values, ci_level=0.95):
+    """
+    Reporting-friendly summary for a 1D numeric sample.
+    Returns mean/SD/SE, median/IQR, min/max, and percentile CI.
+    """
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    n = int(arr.size)
+    if n == 0:
+        return {
+            "n": 0,
+            "mean": np.nan,
+            "std": np.nan,
+            "se": np.nan,
+            "median": np.nan,
+            "q25": np.nan,
+            "q75": np.nan,
+            "min": np.nan,
+            "max": np.nan,
+            "ci_level": float(ci_level),
+            "ci_lower": np.nan,
+            "ci_upper": np.nan,
+        }
+    mean = float(np.mean(arr))
+    std = float(np.std(arr, ddof=1)) if n > 1 else 0.0
+    se = float(std / np.sqrt(n)) if n > 1 else 0.0
+    alpha = max(0.0, min(1.0, 1.0 - float(ci_level)))
+    lo_q = 100.0 * (alpha / 2.0)
+    hi_q = 100.0 * (1.0 - alpha / 2.0)
+    return {
+        "n": n,
+        "mean": mean,
+        "std": std,
+        "se": se,
+        "median": float(np.median(arr)),
+        "q25": float(np.percentile(arr, 25)),
+        "q75": float(np.percentile(arr, 75)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "ci_level": float(ci_level),
+        "ci_lower": float(np.percentile(arr, lo_q)),
+        "ci_upper": float(np.percentile(arr, hi_q)),
+    }
 
 
 def jaccard_stability_common_subjects(label_dicts, label_key, precomputed_alignment=None):
@@ -2306,6 +2415,7 @@ def do_merge(args):
     Recalculate the stability across the entire data. 
     Then apply SVM if requested.
     """
+    t_merge_start = time.time()
     base_dir = os.path.abspath(getattr(args, 'base_dir', "."))
     results_root = _resolve_path(base_dir, "results")
     output_final_metrics_path = _resolve_path(base_dir, args.output_final_metrics) if args.output_final_metrics else None
@@ -2349,16 +2459,21 @@ def do_merge(args):
     print("Final selected parameters across folds:", final_params)
 
 
-    # Retrain AE on the train split only:
-    ae_data, subject_id_list, dict_final = preprocessing(
+    # Retrain AE on the full dataset and export full preprocessing details for reuse/debugging.
+    export_preprocessing_details = True
+    t_preprocess_start = time.time()
+    ae_data, subject_id_list, dict_final, preprocessing_details = preprocessing(
         df, meta,
         subject_id_column=args.subject_id_column,
         col_threshold=args.col_threshold,
         row_threshold=args.row_threshold,
         skew_threshold=args.skew_threshold,
         scaler_type=args.scaler_type,
-        modalities=args.modalities
+        modalities=args.modalities,
+        export_preprocessing_details=export_preprocessing_details
     )
+    t_preprocess_end = time.time()
+    preprocessing_seconds = float(t_preprocess_end - t_preprocess_start)
 
     # Assert identical subject order across modalities after preprocessing
     base_ids = dict_final[args.modalities[0]][args.subject_id_column].tolist()
@@ -2366,6 +2481,7 @@ def do_merge(args):
         assert dict_final[m][args.subject_id_column].tolist() == base_ids, \
             f"Subject-ID order mismatch between {args.modalities[0]} and {m} after preprocessing"
 
+    t_dimred_start = time.time()
     if args.dim_reduction is None or args.dim_reduction.lower() == 'none':
         print("Skipping VAE and using preprocessed features as latent representations.")
         # Build VAE-like output from the fully preprocessed & scaled per-modality dataframes
@@ -2426,6 +2542,8 @@ def do_merge(args):
         print("PCA dimensionality reduction completed.")
     else:
         raise ValueError(f"Unknown dim_reduction method: {args.dim_reduction}")
+    t_dimred_end = time.time()
+    dim_reduction_seconds = float(t_dimred_end - t_dimred_start)
 
 
    # Prepare latent representations per modality
@@ -2881,12 +2999,15 @@ def do_merge(args):
 
 
             
+    t_stability_start = time.time()
     if n_boot_full > 0:
         if bootstrap_workers == 1:
             _consume_bootstrap(_run_bootstrap(seed) for seed in seeds)
         else:
             with ThreadPoolExecutor(max_workers=bootstrap_workers) as executor:
                 _consume_bootstrap(executor.map(_run_bootstrap, seeds))
+    t_stability_end = time.time()
+    full_stability_bootstrap_seconds = float(t_stability_end - t_stability_start)
 
     print(f"Completed bootstrap for full-data stability estimation.")
     if full_final_stab_ari is not None:
@@ -2953,6 +3074,670 @@ def do_merge(args):
     mean_view_stability_primary = float(np.mean(per_view_stabilities_primary)) if per_view_stabilities_primary else None
     min_view_stability_primary = float(np.min(per_view_stabilities_primary)) if per_view_stabilities_primary else None
 
+    ########## ------ #########
+    # Permutation p-values for cluster solutions (per modality + integrated)
+    ########## ------ #########
+    t_cluster_pvalues_start = time.time()
+    _n_perm_shared = getattr(args, 'cluster_pvalue_permutations', 200)
+    _n_perm_quality = getattr(args, 'cluster_pvalue_permutations_quality', None)
+    _n_perm_ari = getattr(args, 'cluster_pvalue_permutations_ari', None)
+    if _n_perm_quality is None:
+        _n_perm_quality = _n_perm_shared
+    if _n_perm_ari is None:
+        _n_perm_ari = _n_perm_shared
+    cluster_pvalues = {
+        'enabled': str(getattr(args, 'compute_cluster_pvalues', 'FALSE')).upper() == 'TRUE',
+        'mode': str(getattr(args, 'cluster_pvalue_mode', 'fast')).lower(),
+        'statistic': str(getattr(args, 'cluster_pvalue_stat', 'composite')).lower(),
+        'n_permutations': int(_n_perm_shared),
+        'n_permutations_quality': int(_n_perm_quality),
+        'n_permutations_ari': int(_n_perm_ari),
+        'seed': int(getattr(args, 'cluster_pvalue_seed', 314159)),
+        'workers': None,
+        'observed': {'modalities': None, 'final': None},
+        'null_summary': {'modalities_mean': None, 'modalities_std': None, 'final_mean': None, 'final_std': None},
+        'pvalues_raw': {'modalities': None, 'final': None},
+        'pvalues_fdr': {'modalities': None, 'with_final': None},
+        'ari_stability': {
+            'method': 'label_shuffle_within_bootstrap',
+            'n_permutations': None,
+            'observed': {'modalities': None, 'final': None},
+            'null_summary': {'modalities_mean': None, 'modalities_std': None, 'final_mean': None, 'final_std': None},
+            'pvalues_raw': {'modalities': None, 'final': None},
+            'pvalues_fdr': {'modalities': None, 'with_final': None},
+        },
+        'notes': []
+    }
+
+    def _pval_silhouette_norm(X, labels):
+        labels = np.asarray(labels)
+        valid = labels >= 0
+        if not np.any(valid):
+            return np.nan
+        Xv = np.asarray(X)[valid]
+        lv = labels[valid]
+        if Xv.shape[0] < 3 or len(np.unique(lv)) <= 1:
+            return np.nan
+        try:
+            sil = silhouette_score(Xv, lv)
+            return float((sil + 1.0) / 2.0)
+        except Exception:
+            return np.nan
+
+    def _pval_ch_norm(X, labels):
+        labels = np.asarray(labels)
+        valid = labels >= 0
+        if not np.any(valid):
+            return np.nan
+        Xv = np.asarray(X)[valid]
+        lv = labels[valid]
+        if Xv.shape[0] < 3 or len(np.unique(lv)) <= 1:
+            return np.nan
+        try:
+            ch = calinski_harabasz_score(Xv, lv)
+            return float(ch / (ch + 1.0))
+        except Exception:
+            return np.nan
+
+    def _pval_db_inv(X, labels):
+        labels = np.asarray(labels)
+        valid = labels >= 0
+        if not np.any(valid):
+            return np.nan
+        Xv = np.asarray(X)[valid]
+        lv = labels[valid]
+        if Xv.shape[0] < 3 or len(np.unique(lv)) <= 1:
+            return np.nan
+        try:
+            db = davies_bouldin_score(Xv, lv)
+            return float(1.0 / (1.0 + db))
+        except Exception:
+            return np.nan
+
+    def _cluster_stat(X, labels, stat_name):
+        if stat_name == 'silhouette':
+            return _pval_silhouette_norm(X, labels)
+        s = _pval_silhouette_norm(X, labels)
+        c = _pval_ch_norm(X, labels)
+        d = _pval_db_inv(X, labels)
+        vals = [v for v in [s, c, d] if np.isfinite(v)]
+        if not vals:
+            return np.nan
+        return float(np.mean(vals))
+
+    def _permute_columns(X, rng):
+        X = np.asarray(X)
+        out = np.empty_like(X)
+        n = X.shape[0]
+        for j in range(X.shape[1]):
+            idx = rng.permutation(n)
+            out[:, j] = X[idx, j]
+        return out
+
+    def _bh_fdr(pvals):
+        pvals = np.asarray(pvals, dtype=float)
+        m = pvals.size
+        if m == 0:
+            return []
+        order = np.argsort(np.nan_to_num(pvals, nan=np.inf))
+        sorted_p = pvals[order]
+        q = np.full(m, np.nan, dtype=float)
+        prev = 1.0
+        for i in range(m - 1, -1, -1):
+            p = sorted_p[i]
+            rank = i + 1
+            val = np.nan if not np.isfinite(p) else min(prev, (p * m) / rank)
+            q[i] = val
+            prev = 1.0 if not np.isfinite(val) else val
+        out = np.full(m, np.nan, dtype=float)
+        out[order] = q
+        return out.tolist()
+
+    if cluster_pvalues['enabled']:
+        mode = cluster_pvalues['mode']
+        stat_name = cluster_pvalues['statistic']
+        B = max(1, cluster_pvalues['n_permutations_quality'])
+        seed0 = cluster_pvalues['seed']
+        if mode not in ('fast', 'full'):
+            cluster_pvalues['notes'].append(f"Unknown cluster_pvalue_mode '{mode}', falling back to 'fast'.")
+            mode = 'fast'
+            cluster_pvalues['mode'] = mode
+        if stat_name not in ('composite', 'silhouette'):
+            cluster_pvalues['notes'].append(f"Unknown cluster_pvalue_stat '{stat_name}', falling back to 'composite'.")
+            stat_name = 'composite'
+            cluster_pvalues['statistic'] = stat_name
+
+        if final_labels is None or indiv_labels is None:
+            cluster_pvalues['notes'].append("Missing final/individual labels; p-value computation skipped.")
+        else:
+            obs_view = []
+            for i, X in enumerate(data_list):
+                labs = indiv_labels[i] if i < len(indiv_labels) else None
+                obs_view.append(np.nan if labs is None else _cluster_stat(X, labs, stat_name))
+            X_concat = np.hstack([np.asarray(X) for X in data_list]) if data_list else np.empty((0, 0))
+            obs_final = _cluster_stat(X_concat, final_labels, stat_name)
+            cluster_pvalues['observed']['modalities'] = [float(x) if np.isfinite(x) else np.nan for x in obs_view]
+            cluster_pvalues['observed']['final'] = float(obs_final) if np.isfinite(obs_final) else np.nan
+
+            raw_workers = getattr(args, 'cluster_pvalue_jobs', 0)
+            if raw_workers in (None, 0):
+                raw_workers = getattr(args, 'n_jobs', 1)
+                if raw_workers in (-1, None):
+                    raw_workers = os.cpu_count() or 1
+            workers = max(1, min(int(raw_workers), B))
+            cluster_pvalues['workers'] = int(workers)
+
+            seeds_perm = [seed0 + b for b in range(B)]
+
+            def _perm_worker(seed_value):
+                rng = np.random.default_rng(seed_value)
+                perm_views = [_permute_columns(X, rng) for X in data_list]
+                if mode == 'full':
+                    try:
+                        perm_final_labels, perm_indiv_labels, _, _, _ = parea_2_mv(
+                            perm_views,
+                            subject_id_list=subject_id_list,
+                            inner_jobs=1,
+                            pre_inner_jobs=1,
+                            mincluster=args.mincluster,
+                            mincluster_n=args.mincluster_n,
+                            **final_params
+                        )
+                    except Exception:
+                        return [np.nan] * len(args.modalities), np.nan
+                else:
+                    perm_indiv_labels = indiv_labels
+                    perm_final_labels = final_labels
+
+                perm_view_stats = []
+                for i, Xp in enumerate(perm_views):
+                    labs = perm_indiv_labels[i] if i < len(perm_indiv_labels) else None
+                    perm_view_stats.append(np.nan if labs is None else _cluster_stat(Xp, labs, stat_name))
+
+                Xc = np.hstack([np.asarray(Xp) for Xp in perm_views]) if perm_views else np.empty((0, 0))
+                perm_final_stat = _cluster_stat(Xc, perm_final_labels, stat_name)
+                return perm_view_stats, perm_final_stat
+
+            if workers == 1:
+                perm_results = [_perm_worker(s) for s in seeds_perm]
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    perm_results = list(executor.map(_perm_worker, seeds_perm))
+
+            null_view = np.array([r[0] for r in perm_results], dtype=float) if perm_results else np.empty((0, len(args.modalities)))
+            null_final = np.array([r[1] for r in perm_results], dtype=float) if perm_results else np.empty((0,), dtype=float)
+
+            pvals_view = []
+            for i, obs in enumerate(obs_view):
+                if not np.isfinite(obs):
+                    pvals_view.append(np.nan)
+                    continue
+                ni = null_view[:, i]
+                ni = ni[np.isfinite(ni)]
+                if ni.size == 0:
+                    pvals_view.append(np.nan)
+                    continue
+                p = (1.0 + np.sum(ni >= obs)) / (ni.size + 1.0)
+                pvals_view.append(float(p))
+
+            if np.isfinite(obs_final):
+                nf = null_final[np.isfinite(null_final)]
+                p_final = float((1.0 + np.sum(nf >= obs_final)) / (nf.size + 1.0)) if nf.size > 0 else np.nan
+            else:
+                p_final = np.nan
+
+            pvals_with_final = list(pvals_view) + [p_final]
+            cluster_pvalues['null_summary']['modalities_mean'] = np.nanmean(null_view, axis=0).tolist() if null_view.size else None
+            cluster_pvalues['null_summary']['modalities_std'] = np.nanstd(null_view, axis=0).tolist() if null_view.size else None
+            cluster_pvalues['null_summary']['final_mean'] = float(np.nanmean(null_final)) if null_final.size else None
+            cluster_pvalues['null_summary']['final_std'] = float(np.nanstd(null_final)) if null_final.size else None
+            cluster_pvalues['pvalues_raw']['modalities'] = pvals_view
+            cluster_pvalues['pvalues_raw']['final'] = p_final
+            cluster_pvalues['pvalues_fdr']['modalities'] = _bh_fdr(pvals_view)
+            cluster_pvalues['pvalues_fdr']['with_final'] = _bh_fdr(pvals_with_final)
+    t_cluster_pvalues_end = time.time()
+    cluster_pvalues_seconds = float(t_cluster_pvalues_end - t_cluster_pvalues_start)
+
+    def _pairwise_scores_common_subjects(label_dicts, label_key="labels", metric="ari", precomputed_alignment=None):
+        scores = []
+        if not label_dicts or len(label_dicts) < 2:
+            return scores
+        if precomputed_alignment is None:
+            for d1, d2 in combinations(label_dicts, 2):
+                u1, l1 = _collapse_duplicates(d1["orig_ids"], d1[label_key])
+                u2, l2 = _collapse_duplicates(d2["orig_ids"], d2[label_key])
+                common, idx1, idx2 = np.intersect1d(u1, u2, return_indices=True)
+                if len(common) <= 1:
+                    continue
+                a = l1[idx1]
+                b = l2[idx2]
+                if metric == "ari":
+                    scores.append(float(adjusted_rand_score(a, b)))
+                elif metric == "jaccard":
+                    scores.append(float(_partition_jaccard_from_labels(a, b)))
+            return scores
+
+        labels_collapsed = []
+        for d in label_dicts:
+            _, labs = _collapse_duplicates(d["orig_ids"], d[label_key])
+            labels_collapsed.append(np.asarray(labs))
+        for b1, b2, idx1, idx2 in precomputed_alignment.get("pair_indices", []):
+            a = labels_collapsed[b1][idx1]
+            b = labels_collapsed[b2][idx2]
+            if metric == "ari":
+                scores.append(float(adjusted_rand_score(a, b)))
+            elif metric == "jaccard":
+                scores.append(float(_partition_jaccard_from_labels(a, b)))
+        return scores
+
+    def _collapsed_labels_from_dicts(label_dicts, label_key="labels"):
+        labels_collapsed = []
+        for d in label_dicts:
+            _, labs = _collapse_duplicates(d["orig_ids"], d[label_key])
+            labels_collapsed.append(np.asarray(labs))
+        return labels_collapsed
+
+    def _mean_pairwise_ari_from_alignment(labels_collapsed, precomputed_alignment):
+        if precomputed_alignment is None:
+            return np.nan
+        pair_indices = precomputed_alignment.get("pair_indices", [])
+        if not pair_indices:
+            return np.nan
+        scores = []
+        for b1, b2, idx1, idx2 in pair_indices:
+            a = labels_collapsed[b1][idx1]
+            b = labels_collapsed[b2][idx2]
+            if a.size > 1:
+                scores.append(float(adjusted_rand_score(a, b)))
+        return float(np.mean(scores)) if scores else np.nan
+
+    def _permute_collapsed_labels(labels_collapsed, rng):
+        permuted = []
+        for labs in labels_collapsed:
+            if labs.size <= 1:
+                permuted.append(labs.copy())
+            else:
+                permuted.append(labs[rng.permutation(labs.size)])
+        return permuted
+
+    def _cluster_composition(labels):
+        if labels is None:
+            return {"n_total": 0, "n_labeled": 0, "counts": {}, "proportions": {}}
+        arr = np.asarray(labels)
+        n_total = int(arr.size)
+        valid = arr[arr >= 0]
+        n_labeled = int(valid.size)
+        if n_labeled == 0:
+            return {"n_total": n_total, "n_labeled": 0, "counts": {}, "proportions": {}}
+        uniq, cnt = np.unique(valid, return_counts=True)
+        return {
+            "n_total": n_total,
+            "n_labeled": n_labeled,
+            "counts": {str(int(k)): int(v) for k, v in zip(uniq, cnt)},
+            "proportions": {str(int(k)): float(v / n_labeled) for k, v in zip(uniq, cnt)},
+        }
+
+    def _quality_components_from_features(X, labels):
+        labels = np.asarray(labels) if labels is not None else np.array([])
+        if labels.size == 0:
+            return {"n_labeled": 0, "n_clusters": 0, "silhouette_norm": np.nan, "ch_norm": np.nan, "db_inv": np.nan, "composite": np.nan}
+        valid = labels >= 0
+        if not np.any(valid):
+            return {"n_labeled": 0, "n_clusters": 0, "silhouette_norm": np.nan, "ch_norm": np.nan, "db_inv": np.nan, "composite": np.nan}
+        Xv = np.asarray(X)[valid]
+        lv = labels[valid]
+        n_clusters = int(len(np.unique(lv)))
+        if Xv.shape[0] < 3 or n_clusters <= 1:
+            return {"n_labeled": int(Xv.shape[0]), "n_clusters": n_clusters, "silhouette_norm": np.nan, "ch_norm": np.nan, "db_inv": np.nan, "composite": np.nan}
+        try:
+            sil = float((silhouette_score(Xv, lv) + 1.0) / 2.0)
+        except Exception:
+            sil = np.nan
+        try:
+            ch = calinski_harabasz_score(Xv, lv)
+            chn = float(ch / (ch + 1.0))
+        except Exception:
+            chn = np.nan
+        try:
+            db = davies_bouldin_score(Xv, lv)
+            dbi = float(1.0 / (1.0 + db))
+        except Exception:
+            dbi = np.nan
+        vals = [v for v in [sil, chn, dbi] if np.isfinite(v)]
+        return {
+            "n_labeled": int(Xv.shape[0]),
+            "n_clusters": n_clusters,
+            "silhouette_norm": sil,
+            "ch_norm": chn,
+            "db_inv": dbi,
+            "composite": float(np.mean(vals)) if vals else np.nan
+        }
+
+    def _classical_mds_local(D, p=10):
+        D = np.asarray(D, dtype=float)
+        n = D.shape[0]
+        if n == 0:
+            return np.zeros((0, 0), dtype=float)
+        J = np.eye(n) - np.ones((n, n)) / n
+        B = -0.5 * J.dot(D ** 2).dot(J)
+        evals, evecs = np.linalg.eigh(B)
+        idx = np.argsort(evals)[::-1]
+        evals = evals[idx]
+        evecs = evecs[:, idx]
+        pos = evals > 1e-12
+        if not np.any(pos):
+            return np.zeros((n, 1), dtype=float)
+        m = min(p, int(np.sum(pos)))
+        return evecs[:, pos][:, :m] * np.sqrt(evals[pos][:m])
+
+    def _quality_components_from_consensus(consensus, union_ids, target_ids, target_labels):
+        if consensus is None or union_ids is None or target_labels is None:
+            return {"n_labeled": 0, "n_clusters": 0, "silhouette_norm": np.nan, "ch_norm": np.nan, "db_inv": np.nan, "composite": np.nan}
+        labels = np.asarray(target_labels)
+        valid = labels >= 0
+        if not np.any(valid):
+            return {"n_labeled": 0, "n_clusters": 0, "silhouette_norm": np.nan, "ch_norm": np.nan, "db_inv": np.nan, "composite": np.nan}
+        idx_map = {sid: i for i, sid in enumerate(union_ids)}
+        idxs, labs = [], []
+        for sid, lab in zip(target_ids, labels):
+            if lab < 0:
+                continue
+            i = idx_map.get(sid)
+            if i is None:
+                continue
+            idxs.append(i)
+            labs.append(int(lab))
+        if len(idxs) < 3:
+            return {"n_labeled": len(idxs), "n_clusters": len(set(labs)), "silhouette_norm": np.nan, "ch_norm": np.nan, "db_inv": np.nan, "composite": np.nan}
+        D = 1.0 - np.asarray(consensus, dtype=float)[np.ix_(idxs, idxs)]
+        labs = np.asarray(labs)
+        n_clusters = int(len(np.unique(labs)))
+        if n_clusters <= 1:
+            return {"n_labeled": len(idxs), "n_clusters": n_clusters, "silhouette_norm": np.nan, "ch_norm": np.nan, "db_inv": np.nan, "composite": np.nan}
+        try:
+            sil = float((silhouette_score(D, labs, metric="precomputed") + 1.0) / 2.0)
+        except Exception:
+            sil = np.nan
+        X_mds = _classical_mds_local(D, p=min(10, D.shape[0] - 1))
+        try:
+            ch = calinski_harabasz_score(X_mds, labs)
+            chn = float(ch / (ch + 1.0))
+        except Exception:
+            chn = np.nan
+        try:
+            db = davies_bouldin_score(X_mds, labs)
+            dbi = float(1.0 / (1.0 + db))
+        except Exception:
+            dbi = np.nan
+        vals = [v for v in [sil, chn, dbi] if np.isfinite(v)]
+        return {"n_labeled": len(idxs), "n_clusters": n_clusters, "silhouette_norm": sil, "ch_norm": chn, "db_inv": dbi, "composite": float(np.mean(vals)) if vals else np.nan}
+
+    def _assignment_certainty_from_consensus(consensus, union_ids, target_ids, target_labels, uncertain_threshold=0.60):
+        empty = {
+            "n_assessed": 0,
+            "uncertain_threshold": float(uncertain_threshold),
+            "uncertain_n": 0,
+            "uncertain_fraction": np.nan,
+            "assigned_cluster_mean_consensus": _distribution_summary([]),
+            "best_cluster_mean_consensus": _distribution_summary([]),
+            "second_best_cluster_mean_consensus": _distribution_summary([]),
+            "margin_best_minus_second": _distribution_summary([]),
+        }
+        if consensus is None or union_ids is None or target_labels is None:
+            return empty
+        C = np.asarray(consensus, dtype=float)
+        labels = np.asarray(target_labels)
+        idx_map = {sid: i for i, sid in enumerate(union_ids)}
+        rows = []
+        assigned = []
+        for sid, lab in zip(target_ids, labels):
+            if lab < 0:
+                continue
+            ui = idx_map.get(sid)
+            if ui is None:
+                continue
+            rows.append((ui, int(lab)))
+            assigned.append(int(lab))
+        if not rows:
+            return empty
+        assigned = np.asarray(assigned, dtype=int)
+        uniq = np.unique(assigned)
+        members = {c: np.where(assigned == c)[0] for c in uniq}
+        assigned_scores, best_scores, second_scores, margins = [], [], [], []
+        for local_i, (ui, lab) in enumerate(rows):
+            means = {}
+            for c in uniq:
+                mem_local = members[c]
+                mem_union = [rows[j][0] for j in mem_local]
+                vals = C[ui, mem_union].astype(float)
+                if int(c) == int(lab):
+                    vals = vals[mem_local != local_i] if len(mem_local) > 1 else np.array([], dtype=float)
+                means[int(c)] = float(np.mean(vals)) if vals.size > 0 else np.nan
+            assigned_score = means.get(int(lab), np.nan)
+            ranked = sorted([v for v in means.values() if np.isfinite(v)], reverse=True)
+            best = ranked[0] if ranked else np.nan
+            second = ranked[1] if len(ranked) > 1 else np.nan
+            margin = (best - second) if np.isfinite(best) and np.isfinite(second) else np.nan
+            assigned_scores.append(assigned_score)
+            best_scores.append(best)
+            second_scores.append(second)
+            margins.append(margin)
+        best_arr = np.asarray(best_scores, dtype=float)
+        uncertain_n = int(np.sum(best_arr < float(uncertain_threshold))) if best_arr.size > 0 else 0
+        n_assessed = int(len(rows))
+        return {
+            "n_assessed": n_assessed,
+            "uncertain_threshold": float(uncertain_threshold),
+            "uncertain_n": uncertain_n,
+            "uncertain_fraction": float(uncertain_n / n_assessed) if n_assessed > 0 else np.nan,
+            "assigned_cluster_mean_consensus": _distribution_summary(assigned_scores),
+            "best_cluster_mean_consensus": _distribution_summary(best_scores),
+            "second_best_cluster_mean_consensus": _distribution_summary(second_scores),
+            "margin_best_minus_second": _distribution_summary(margins),
+        }
+
+    final_pair_align = precompute_bootstrap_pair_alignment(full_label_dicts_final) if len(full_label_dicts_final) >= 2 else None
+    final_stab_ari_dist = _pairwise_scores_common_subjects(full_label_dicts_final, label_key="labels", metric="ari", precomputed_alignment=final_pair_align)
+    final_stab_jaccard_dist = _pairwise_scores_common_subjects(full_label_dicts_final, label_key="labels", metric="jaccard", precomputed_alignment=final_pair_align)
+    view_stab_ari_dist = []
+    view_stab_jaccard_dist = []
+    for view_dicts in full_label_dicts_views:
+        align_v = precompute_bootstrap_pair_alignment(view_dicts) if len(view_dicts) >= 2 else None
+        view_stab_ari_dist.append(_pairwise_scores_common_subjects(view_dicts, label_key="labels", metric="ari", precomputed_alignment=align_v))
+        view_stab_jaccard_dist.append(_pairwise_scores_common_subjects(view_dicts, label_key="labels", metric="jaccard", precomputed_alignment=align_v))
+
+    # Permutation p-values for ARI stability (final + per modality)
+    if cluster_pvalues.get('enabled'):
+        B_ari = max(1, int(cluster_pvalues.get('n_permutations_ari', cluster_pvalues.get('n_permutations', 200))))
+        seed_ari0 = int(cluster_pvalues.get('seed', 314159)) + 1000003
+        ari_results = cluster_pvalues.get('ari_stability', {})
+        ari_results['n_permutations'] = int(B_ari)
+
+        view_alignments = [
+            precompute_bootstrap_pair_alignment(vdicts) if len(vdicts) >= 2 else None
+            for vdicts in full_label_dicts_views
+        ]
+        final_labels_collapsed = _collapsed_labels_from_dicts(full_label_dicts_final, label_key="labels")
+        view_labels_collapsed = [
+            _collapsed_labels_from_dicts(vdicts, label_key="labels")
+            for vdicts in full_label_dicts_views
+        ]
+
+        obs_final_ari = _mean_pairwise_ari_from_alignment(final_labels_collapsed, final_pair_align)
+        obs_view_ari = [
+            _mean_pairwise_ari_from_alignment(view_labels_collapsed[i], view_alignments[i])
+            for i in range(len(view_alignments))
+        ]
+
+        ari_results['observed']['modalities'] = [float(x) if np.isfinite(x) else np.nan for x in obs_view_ari]
+        ari_results['observed']['final'] = float(obs_final_ari) if np.isfinite(obs_final_ari) else np.nan
+
+        ari_workers = cluster_pvalues.get('workers')
+        if ari_workers in (None, 0):
+            raw_workers = getattr(args, 'cluster_pvalue_jobs', 0)
+            if raw_workers in (None, 0):
+                raw_workers = getattr(args, 'n_jobs', 1)
+                if raw_workers in (-1, None):
+                    raw_workers = os.cpu_count() or 1
+            ari_workers = max(1, min(int(raw_workers), B_ari))
+        else:
+            ari_workers = max(1, min(int(ari_workers), B_ari))
+
+        seeds_ari = [seed_ari0 + b for b in range(B_ari)]
+
+        def _ari_perm_worker(seed_value):
+            rng = np.random.default_rng(seed_value)
+            perm_final = _permute_collapsed_labels(final_labels_collapsed, rng)
+            perm_final_mean = _mean_pairwise_ari_from_alignment(perm_final, final_pair_align)
+            perm_views_mean = []
+            for i in range(len(view_labels_collapsed)):
+                perm_view_i = _permute_collapsed_labels(view_labels_collapsed[i], rng)
+                perm_views_mean.append(_mean_pairwise_ari_from_alignment(perm_view_i, view_alignments[i]))
+            return perm_views_mean, perm_final_mean
+
+        if ari_workers == 1:
+            ari_perm_results = [_ari_perm_worker(s) for s in seeds_ari]
+        else:
+            with ThreadPoolExecutor(max_workers=ari_workers) as executor:
+                ari_perm_results = list(executor.map(_ari_perm_worker, seeds_ari))
+
+        n_modalities = len(args.modalities)
+        null_view_ari = np.array([r[0] for r in ari_perm_results], dtype=float) if ari_perm_results else np.empty((0, n_modalities), dtype=float)
+        null_final_ari = np.array([r[1] for r in ari_perm_results], dtype=float) if ari_perm_results else np.empty((0,), dtype=float)
+
+        pvals_view_ari = []
+        for i, obs in enumerate(obs_view_ari):
+            if not np.isfinite(obs):
+                pvals_view_ari.append(np.nan)
+                continue
+            ni = null_view_ari[:, i]
+            ni = ni[np.isfinite(ni)]
+            if ni.size == 0:
+                pvals_view_ari.append(np.nan)
+                continue
+            pvals_view_ari.append(float((1.0 + np.sum(ni >= obs)) / (ni.size + 1.0)))
+
+        if np.isfinite(obs_final_ari):
+            nf = null_final_ari[np.isfinite(null_final_ari)]
+            p_final_ari = float((1.0 + np.sum(nf >= obs_final_ari)) / (nf.size + 1.0)) if nf.size > 0 else np.nan
+        else:
+            p_final_ari = np.nan
+
+        ari_with_final = list(pvals_view_ari) + [p_final_ari]
+        ari_results['null_summary']['modalities_mean'] = np.nanmean(null_view_ari, axis=0).tolist() if null_view_ari.size else None
+        ari_results['null_summary']['modalities_std'] = np.nanstd(null_view_ari, axis=0).tolist() if null_view_ari.size else None
+        ari_results['null_summary']['final_mean'] = float(np.nanmean(null_final_ari)) if null_final_ari.size else None
+        ari_results['null_summary']['final_std'] = float(np.nanstd(null_final_ari)) if null_final_ari.size else None
+        ari_results['pvalues_raw']['modalities'] = pvals_view_ari
+        ari_results['pvalues_raw']['final'] = p_final_ari
+        ari_results['pvalues_fdr']['modalities'] = _bh_fdr(pvals_view_ari)
+        ari_results['pvalues_fdr']['with_final'] = _bh_fdr(ari_with_final)
+        cluster_pvalues['ari_stability'] = ari_results
+
+    stability_uncertainty = {
+        "final_ari": _distribution_summary(final_stab_ari_dist),
+        "final_jaccard": _distribution_summary(final_stab_jaccard_dist),
+        "per_view_ari": [_distribution_summary(x) for x in view_stab_ari_dist],
+        "per_view_jaccard": [_distribution_summary(x) for x in view_stab_jaccard_dist],
+    }
+
+    final_consensus = (full_final_stab_SUM_MAT_full or {}).get("consensus", None)
+    final_union_ids = (full_final_stab_SUM_MAT_full or {}).get("union_ids", None)
+    quality_components = {
+        "per_view_feature_space": [
+            _quality_components_from_features(
+                data_list[i],
+                indiv_labels[i] if indiv_labels is not None and i < len(indiv_labels) else None
+            )
+            for i in range(len(args.modalities))
+        ],
+        "final_feature_space": _quality_components_from_features(
+            np.hstack([np.asarray(X) for X in data_list]) if data_list else np.empty((0, 0)),
+            final_labels
+        ),
+        "final_consensus_space": _quality_components_from_consensus(final_consensus, final_union_ids, base_ids, final_labels),
+    }
+
+    cluster_composition = {
+        "final": _cluster_composition(final_labels),
+        "per_view": [
+            _cluster_composition(indiv_labels[i] if indiv_labels is not None and i < len(indiv_labels) else None)
+            for i in range(len(args.modalities))
+        ],
+    }
+
+    assignment_certainty = {
+        "final": _assignment_certainty_from_consensus(final_consensus, final_union_ids, base_ids, final_labels),
+        "per_view": [],
+    }
+    for i in range(len(args.modalities)):
+        diag_v = full_v_stab_SUM_MAT_full[i] if full_v_stab_SUM_MAT_full is not None and i < len(full_v_stab_SUM_MAT_full) else {}
+        c_v = diag_v.get("consensus", None) if isinstance(diag_v, dict) else None
+        ids_v = diag_v.get("union_ids", None) if isinstance(diag_v, dict) else None
+        lbl_v = indiv_labels[i] if indiv_labels is not None and i < len(indiv_labels) else None
+        assignment_certainty["per_view"].append(_assignment_certainty_from_consensus(c_v, ids_v, base_ids, lbl_v))
+
+    dropped_full_modality = preprocessing_details.get("subjects_dropped_full_missing_modality", []) if isinstance(preprocessing_details, dict) else []
+    preprocessing_flow = {
+        "n_input_rows": int(len(df)),
+        "n_after_preprocessing_alignment": preprocessing_details.get("n_subjects_after_alignment") if isinstance(preprocessing_details, dict) else None,
+        "n_dropped_full_missing_modality": int(len(dropped_full_modality)),
+        "n_subjects_with_final_label": int(np.sum(np.asarray(final_labels) >= 0)) if final_labels is not None else 0,
+    }
+
+    runtime_context = {
+        "preprocessing_seconds": preprocessing_seconds,
+        "dim_reduction_seconds": dim_reduction_seconds,
+        "full_stability_bootstrap_seconds": full_stability_bootstrap_seconds,
+        "cluster_pvalues_seconds": cluster_pvalues_seconds,
+        "n_bootstrap_full": int(n_boot_full),
+        "bootstrap_workers": int(bootstrap_workers),
+        "n_jobs": int(args.n_jobs) if getattr(args, "n_jobs", None) is not None else None,
+    }
+
+    final_reporting = {
+        "quality": {
+            "components": quality_components,
+        },
+        "stability": {
+            "point_estimates": {
+                "final_ari": full_final_stab_ari,
+                "final_jaccard": full_final_stab_jaccard,
+                "per_view_ari": full_views_stab_ari,
+                "per_view_jaccard": full_views_stab_jaccard,
+            },
+            "uncertainty": stability_uncertainty,
+        },
+        "clusters": {
+            "composition": cluster_composition,
+            "assignment_certainty": assignment_certainty,
+        },
+        "preprocessing_flow": preprocessing_flow,
+        "runtime_context": runtime_context,
+        "compute_context": {
+            "modalities": list(args.modalities),
+            "scaler_type": args.scaler_type,
+            "dim_reduction": args.dim_reduction,
+            "cluster_pvalue_settings": {
+                "enabled": cluster_pvalues.get("enabled"),
+                "mode": cluster_pvalues.get("mode"),
+                "statistic": cluster_pvalues.get("statistic"),
+                "n_permutations": cluster_pvalues.get("n_permutations"),
+                "n_permutations_quality": cluster_pvalues.get("n_permutations_quality"),
+                "n_permutations_ari": cluster_pvalues.get("n_permutations_ari"),
+                "workers": cluster_pvalues.get("workers"),
+                "seed": cluster_pvalues.get("seed"),
+            },
+        },
+    }
+
+    def _final_reporting_with_runtime():
+        rep = dict(final_reporting)
+        rc = dict(rep.get("runtime_context", {}))
+        rc["total_merge_seconds"] = float(time.time() - t_merge_start)
+        rep["runtime_context"] = rc
+        return rep
+
 
 
     if not output_final_metrics_path:
@@ -2990,9 +3775,12 @@ def do_merge(args):
                 'final_labels': final_labels,
                 'individual_labels': indiv_labels,
                 'final_params': final_params,
+                'preprocessing_details': preprocessing_details,
                 'view_scores_per_view': view_scores_per_view,
                 'view_quality_mean': view_score_mean,
                 'final_quality': final_score,
+                'cluster_pvalues': cluster_pvalues,
+                'final_reporting': _final_reporting_with_runtime(),
 
                 # Primary stability metrics
                 'final_stability': final_stability_primary,
@@ -3035,9 +3823,12 @@ def do_merge(args):
                 'final_labels': final_labels,
                 'individual_labels': indiv_labels,
                 'final_params': final_params,
+                'preprocessing_details': preprocessing_details,
                 'view_scores_per_view': view_scores_per_view,
                 'view_quality_mean': view_score_mean,
                 'final_quality': final_score,
+                'cluster_pvalues': cluster_pvalues,
+                'final_reporting': _final_reporting_with_runtime(),
 
                 # Primary stability metrics
                 'final_stability': final_stability_primary,
@@ -3162,9 +3953,12 @@ def do_merge(args):
                 'final_labels': final_labels,
                 'individual_labels': indiv_labels,
                 'final_params': final_params,
+                'preprocessing_details': preprocessing_details,
                 'view_scores_per_view': view_scores_per_view,
                 'view_quality_mean': view_score_mean,
                 'final_quality': final_score,
+                'cluster_pvalues': cluster_pvalues,
+                'final_reporting': _final_reporting_with_runtime(),
 
                 # Primary stability metrics
                 'final_stability': final_stability_primary,
@@ -3213,9 +4007,12 @@ def do_merge(args):
             'final_labels': final_labels,
             'individual_labels': indiv_labels,
             'final_params': final_params,
+            'preprocessing_details': preprocessing_details,
             'view_scores_per_view': view_scores_per_view,
             'view_quality_mean': view_score_mean,
             'final_quality': final_score,
+            'cluster_pvalues': cluster_pvalues,
+            'final_reporting': _final_reporting_with_runtime(),
 
             # Primary stability metrics
             'final_stability': final_stability_primary,
@@ -3793,6 +4590,22 @@ if __name__ == '__main__':
     parser.add_argument('--fold_index', type=int)
     parser.add_argument('--output_metrics', type=str)
     parser.add_argument('--output_final_metrics', type=str)
+    parser.add_argument('--compute_cluster_pvalues', choices=['TRUE', 'FALSE'], default='FALSE',
+                        help='Compute permutation-based p-values for each modality and final cluster solution in merge mode.')
+    parser.add_argument('--cluster_pvalue_mode', choices=['fast', 'full'], default='fast',
+                        help='Permutation mode: fast keeps labels fixed; full reclusters each permuted dataset.')
+    parser.add_argument('--cluster_pvalue_stat', choices=['composite', 'silhouette'], default='composite',
+                        help='Cluster-separation statistic used for permutation p-values.')
+    parser.add_argument('--cluster_pvalue_permutations', type=int, default=200,
+                        help='Number of permutations for cluster p-value estimation.')
+    parser.add_argument('--cluster_pvalue_permutations_quality', type=int, default=None,
+                        help='Number of permutations for quality-score p-value estimation (defaults to --cluster_pvalue_permutations).')
+    parser.add_argument('--cluster_pvalue_permutations_ari', type=int, default=None,
+                        help='Number of permutations for ARI-stability p-value estimation (defaults to --cluster_pvalue_permutations).')
+    parser.add_argument('--cluster_pvalue_jobs', type=int, default=0,
+                        help='Parallel workers for permutation p-values (0 -> use --n_jobs setting).')
+    parser.add_argument('--cluster_pvalue_seed', type=int, default=314159,
+                        help='Base RNG seed for permutation p-value computation.')
     parser.add_argument('--TEST-phase', choices=[0,1,2,3,4], type=int, default=0,
                         help='For TEST mode: which phase to run (0=Full pipeline, 1=Only Kmeans, 2=Only Spectral, 3=Test fusion matrix, 4=Test final clustering, 5=Test only individual labels but full ensemble.)')
     parser.add_argument('--ga_cxpb', type=float, default=0.7,
